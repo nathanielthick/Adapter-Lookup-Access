@@ -6,8 +6,8 @@ There are two ways to run it:
  B. "Adapter Lookup.bat"  - runs adapter_lookup.py with Python (for editing the code).
 
 OPTION A - THE EXE (no Python needed)
- 1. Copy "Adapter Lookup.exe" into the same folder as the .accdb / .mdb file
-    (e.g. next to SIGBOARDS.mdb).
+ 1. Copy "Adapter Lookup.exe" anywhere (e.g. your Desktop). It opens the
+    shared database on the Z: drive (see DATABASE below).
  2. The Microsoft Access ODBC driver must be installed. Most PCs with Office
     already have it. If the exe says no driver was found, install the free
     "Microsoft Access Database Engine 2016 Redistributable" from Microsoft -
@@ -25,13 +25,16 @@ OPTION B - PYTHON SCRIPT
     - If it says NOT FOUND: install the free "Microsoft Access Database Engine 2016
       Redistributable" from Microsoft. Pick the version (x64 / x86) that matches
       the bitness the script reports. If you have 64-bit Office, use 64-bit Python.
- 3. Put your .accdb (or .mdb) file in this folder.
  Running:
  Double-click "Adapter Lookup.bat".
  Try it without a database:  py adapter_lookup.py --demo
 
-Either way, it opens the database in its folder (or asks you to pick one, and
-remembers your choice). File > Open database... to switch.
+DATABASE
+ Either way, it opens the shared database:
+     Z:\Quality Assurance\TEST FLOOR\SIGBOARDS.mdb
+ (only its CONNECTORS table is used). If the Z: drive isn't connected, it looks
+ for a .mdb / .accdb next to the program or asks you to pick one, and remembers
+ your choice. File > Open database... to switch.
 
 REBUILDING THE EXE (after changing adapter_lookup.py)
  Requires Python (see Option B). Double-click "Build EXE.bat". It installs

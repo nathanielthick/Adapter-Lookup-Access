@@ -1,8 +1,7 @@
 {
-  "last_db": "C:/Users/nthickett/Desktop/Adapter Lookup/SIGBOARDS.mdb",
+  "last_db": "Z:/Quality Assurance/TEST FLOOR/SIGBOARDS.mdb",
   "tables": {
-    "C:\\Users\\nthickett\\Desktop\\Adapter Lookup\\SIGBOARDS.mdb": "CONNECTORS",
-    "C:/Users/nthickett/Desktop/Adapter Lookup/SIGBOARDS.mdb": "CONNECTORS"
+    "Z:/Quality Assurance/TEST FLOOR/SIGBOARDS.mdb": "CONNECTORS"
   },
   "group": false,
   "hide_scrapped": true
