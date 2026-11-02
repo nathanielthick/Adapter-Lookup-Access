@@ -10,3 +10,7 @@ __pycache__/
 # Access lock files
 *.ldb
 *.laccdb
+
+# Access databases (too large for GitHub; keep locally)
+*.mdb
+*.accdb
