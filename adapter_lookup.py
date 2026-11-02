@@ -38,21 +38,21 @@ MAX_ROWS = 20000         # most connector rows shown at once
 DISTINCT_LIMIT = 250     # columns with this many values or fewer get a pick-list
 
 # ---- Settings for the SIGBOARDS database --------------------------------- #
-DEFAULT_DB = r"Z:\Quality Assurance\TEST FLOOR\SIGBOARDS.mdb"  # used when none is saved
+DEFAULT_DB = r"Z:\Engineering\Test Engineering\Test\Test Board DB\SIGBOARDS.mdb"  # used when none is saved
 DEFAULT_TABLE = "CONNECTORS"     # the only table used when it exists
-GROUP_COLUMN = "BOARD"           # one adapter = all rows with the same value here
-PART_COLUMN = "CONNECTOR"        # the connector part number
+GROUP_COLUMN = "BOARD/ADAPTER"   # one adapter = all rows with the same value here
+PART_COLUMN = "CONNECTOR P/N"    # the connector part number
 # A row counts as scrapped when one of these columns matches the text (any case).
-SCRAP_RULES = [("DESCRIPTION", "SCRAPPED")]
+SCRAP_RULES = [("Port", "SCRAP"), ("Category", "SCRAPPED")]
 # Order of the result columns and of the filters (other columns go after).
-RESULT_ORDER = ["BOARD", "CONNECTOR", "Qty", "DESCRIPTION", "Positions", "Category",
-                "Contact Type", "Housing Type", "Series", "Arrangement", "Shell Size",
-                "Keying", "Pitch", "Mil Spec", "Manufacturer", "Mates With", "Map",
-                "CategoryID"]
-FILTER_ORDER = ["BOARD", "CONNECTOR", "DESCRIPTION", "Positions", "Category",
-                "Contact Type", "Housing Type", "Series", "Arrangement", "Shell Size",
-                "Keying", "Pitch", "Mil Spec", "Manufacturer", "Mates With", "Qty",
-                "CategoryID"]
+RESULT_ORDER = ["BOARD/ADAPTER", "CONNECTOR P/N", "Qty", "DESCRIPTION", "Positions",
+                "Category", "Contact Type", "Housing Type", "Series", "Arrangement",
+                "Shell", "Keying", "Pitch", "Manufacturer", "LOCATION", "Port",
+                "CUSTOMER", "Relevant Assemblies", "OBSOLETE", "Voltage Rating"]
+FILTER_ORDER = ["BOARD/ADAPTER", "CONNECTOR P/N", "DESCRIPTION", "Positions", "Category",
+                "Contact Type", "Housing Type", "Series", "Arrangement", "Shell", "Keying",
+                "Pitch", "Manufacturer", "CUSTOMER", "Relevant Assemblies", "LOCATION",
+                "Port", "OBSOLETE", "Voltage Rating", "Qty"]
 FRIENDLY_LABELS = {"Positions": "Positions (pins)"}
 PLACEHOLDERS = {"", "-", "--", "?", "??"}  # left out of pick-lists
 

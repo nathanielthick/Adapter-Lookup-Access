@@ -31,7 +31,7 @@ OPTION B - PYTHON SCRIPT
 
 DATABASE
  Either way, it opens the shared database:
-     Z:\Quality Assurance\TEST FLOOR\SIGBOARDS.mdb
+     Z:\Engineering\Test Engineering\Test\Test Board DB\SIGBOARDS.mdb
  (only its CONNECTORS table is used). If the Z: drive isn't connected, it looks
  for a .mdb / .accdb next to the program or asks you to pick one, and remembers
  your choice. File > Open database... to switch.

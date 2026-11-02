@@ -1,7 +1,7 @@
 {
-  "last_db": "Z:/Quality Assurance/TEST FLOOR/SIGBOARDS.mdb",
+  "last_db": "Z:/Engineering/Test Engineering/Test/Test Board DB/SIGBOARDS.mdb",
   "tables": {
-    "Z:/Quality Assurance/TEST FLOOR/SIGBOARDS.mdb": "CONNECTORS"
+    "Z:/Engineering/Test Engineering/Test/Test Board DB/SIGBOARDS.mdb": "CONNECTORS"
   },
   "group": false,
   "hide_scrapped": true
