@@ -1,7 +1,7 @@
 # PyInstaller build output
 build/
 dist/
-*.exe
+# (Adapter Lookup.exe is committed so users can download it)
 
 # Python
 __pycache__/
