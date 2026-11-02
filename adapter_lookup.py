@@ -17,6 +17,7 @@ Run with --demo to try it on built-in sample data (no Access driver needed).
 """
 import csv
 import datetime as dt
+import decimal
 import glob
 import json
 import os
@@ -275,10 +276,28 @@ class AccessBackend:
                 out.append((row.table_name, row.table_type == "VIEW"))
         return sorted(out, key=lambda t: (t[1], t[0].lower()))
 
+    def has_table(self, table):
+        try:
+            self.execute(f"SELECT * FROM {qi(table)} WHERE 1=0")
+            return True
+        except Exception:
+            return False
+
     def columns(self, table):
-        cur = self.conn.cursor()
-        rows = sorted(cur.columns(table=table), key=lambda r: r.ordinal_position)
-        return [Column(r.column_name, r.type_name) for r in rows]
+        # Read names/types from an empty query rather than cursor.columns():
+        # the Access driver's catalog call sometimes returns corrupt text,
+        # which pyodbc fails to decode (UnicodeDecodeError).
+        cur = self.execute(f"SELECT * FROM {qi(table)} WHERE 1=0")
+        types = {bool: "BIT", int: "INTEGER", float: "DOUBLE", decimal.Decimal: "DECIMAL",
+                 dt.datetime: "DATETIME", dt.date: "DATE", bytes: "LONGBINARY",
+                 bytearray: "LONGBINARY"}
+        out = []
+        for d in cur.description:
+            name = types.get(d[1])
+            if name is None:   # text: over 255 characters means a Memo / Long Text field
+                name = "LONGCHAR" if (d[3] or 0) > 255 else "VARCHAR"
+            out.append(Column(d[0], name))
+        return out
 
     def execute(self, sql, params=()):
         cur = self.conn.cursor()
@@ -309,6 +328,11 @@ class SqliteBackend:
             "SELECT name, type FROM sqlite_master WHERE type IN ('table','view') "
             "AND name NOT LIKE 'sqlite_%' ORDER BY type, name").fetchall()
         return [(n, t == "view") for n, t in rows]
+
+    def has_table(self, table):
+        return self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') "
+            "AND lower(name) = lower(?)", (table,)).fetchone() is not None
 
     def columns(self, table):
         rows = self.conn.execute(f"PRAGMA table_info({qi(table)})").fetchall()
@@ -668,7 +692,10 @@ class App(tk.Tk):
     def open_db(self, path, sqlite=False):
         try:
             backend = SqliteBackend(path) if sqlite else AccessBackend(path)
-            tables = backend.tables()
+            # Go straight to the connectors table; only list the tables (a driver
+            # catalog call that can fail to decode) when it isn't there.
+            tables = ([(DEFAULT_TABLE, False)] if backend.has_table(DEFAULT_TABLE)
+                      else backend.tables())
         except Exception as e:
             messagebox.showerror(APP_TITLE, f"Couldn't open the database:\n{path}\n\n{e}")
             return
