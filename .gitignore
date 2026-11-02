@@ -1,0 +1,12 @@
+# PyInstaller build output
+build/
+dist/
+*.exe
+
+# Python
+__pycache__/
+*.pyc
+
+# Access lock files
+*.ldb
+*.laccdb
