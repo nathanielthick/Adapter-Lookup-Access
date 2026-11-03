@@ -4,5 +4,6 @@
     "Z:/Engineering/Test Engineering/Test/Test Board DB/SIGBOARDS.mdb": "CONNECTORS"
   },
   "group": false,
-  "hide_scrapped": true
+  "hide_scrapped": true,
+  "more_filters": false
 }

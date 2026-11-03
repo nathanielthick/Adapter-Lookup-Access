@@ -14,3 +14,12 @@ __pycache__/
 # Access databases (too large for GitHub; keep locally)
 *.mdb
 *.accdb
+
+# Raw screen recordings (the compressed demo is in docs/)
+Recording*.mp4
+
+# Change log written when editing (lives next to the database)
+*_change_log.csv
+
+# Earlier copies of the script kept locally
+old versions/

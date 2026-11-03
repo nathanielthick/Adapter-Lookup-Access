@@ -43,19 +43,49 @@ REBUILDING THE EXE (after changing adapter_lookup.py)
  the Python used to build it (64-bit Python -> 64-bit exe -> needs the x64 driver).
 
 SEARCHING
- - Part number / keywords box: results update as you type. Several words = all
-   must match. * is a wildcard (ADP-*-1005). Use the "in" box to search one
-   column only (e.g. just the part number column).
- - Filters panel (left) is built from your table's columns:
-     pick-lists  for columns with up to 60 distinct values (connector type, gender...)
+ - Search box (top): results update as you type. Several words = all must
+   match. * is a wildcard (ADP-*-1005). Use the "in" box to search one column
+   only. Ctrl+F jumps to the search box, Esc clears it.
+ - Filters panel (left). The most useful filters are always shown; click
+   "More filters" for the rest.
+     pick-lists  for columns with up to 250 distinct values (Category, Contact Type...)
                  picking a value = exact match; typing = "contains"
-     X to Y      for number columns (pin count, length, size...) - leave either side blank
+     min to max  for number columns (Positions, Qty) - leave either side blank
      Yes/No      for checkbox columns
-     dates       YYYY-MM-DD or MM/DD/YYYY
-   Press Enter in a box (or pick from a list) to apply. "Clear all" resets everything.
- - Table box: switch between tables and saved Access queries.
- - Click a column header to sort. Double-click a row for all its details.
- - Right-click / Ctrl+C to copy rows or just part numbers.
+   Filters apply as you type. Each active filter shows as a blue chip above the
+   results - click its x to remove it. "Reset all" / "Clear all" resets everything.
+ - Group by adapter: shows every connector on each matching adapter, with the
+   connectors that matched highlighted. Hide scrapped: leaves out scrapped rows.
+ - Details panel (right) shows every field of the selected row. Double-click a
+   value there to copy it. View > Show / hide details panel to turn it off.
+ - Click a column header to sort. Right-click / Ctrl+C to copy rows or part numbers.
  - Export CSV saves the current results (opens in Excel).
 
-The database is opened read-only. Nothing in it is ever changed.
+EDITING (adding, changing and deleting connectors)
+ The app opens the database read-only. To make changes, click "Enable editing"
+ in the top bar. It offers to save a backup copy of the database first (yes is
+ recommended the first time). While editing is on an orange bar is shown, and:
+ - "+ New connector" (Ctrl+N) adds a row. If an adapter or one of its connectors
+   is selected, the adapter number is filled in for you. Right-click >
+   "Add connector to this adapter" does the same.
+ - "Edit" (F2, or double-click a row) changes the selected connector. Changed
+   fields turn orange in the form. Ctrl+S or Save writes the change.
+ - "Duplicate" (Ctrl+D) copies the selected connector into a new row to adjust.
+ - "Delete" (Del key) deletes the selected rows after asking. Selecting an
+   adapter heading selects all of its connectors.
+ - Ctrl+Z / "Undo last change" undoes your changes one at a time, until you close
+   the app.
+ - Fields marked * are required. Drop-downs offer the existing values; if you
+   type a value that only differs in capitals from an existing one (e.g.
+   "d-sub"), the existing spelling is used, so the data stays consistent.
+ - Every change is written to SIGBOARDS_change_log.csv next to the database
+   (or next to the app if that folder can't be written). It records when, who
+   (Windows user name), what was done and the before/after values.
+   Edit > Open change log opens it in Excel.
+ - The CONNECTORS table has no ID column, so a row is found by matching all of
+   its values. If two rows are completely identical, the app won't change or
+   delete either of them (it can't tell them apart) - fix those in Access.
+   A change is also refused if someone else changed the row since you loaded
+   it; press F5 to reload and try again.
+ - Click "Editing ON - click to stop" to go back to read-only.
+ File > Back up database now... saves a copy at any time.

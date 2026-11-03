@@ -1,31 +1,34 @@
 #!/usr/bin/env python3
 """
-Adapter Lookup - a search window for an Access database of adapters.
+Adapter Lookup - search, and optionally edit, the CONNECTORS table of an
+Access database of adapters.
 
-* Finds the .accdb / .mdb next to this script (or asks you to pick one).
-* Reads the tables / saved queries and their columns automatically.
-* Top search box: part number or keywords (use * as a wildcard). Searches all
-  columns, or just the one chosen in the "in" box.
-* Left panel: one filter per column - pick-lists for columns with few distinct
-  values (connector / interface type...), min-max ranges for numbers (pin
-  count, size...), Yes/No for checkboxes, date ranges for dates.
-* Click a column header to sort, double-click a row for full details,
-  Ctrl+C copies selected rows, File > Export saves results to CSV.
+* Finds the .accdb / .mdb (shared Z: drive copy, last used, or next to the app).
+* Search box: adapter, part number or keywords (* is a wildcard).
+* Filters panel: pick-lists, number ranges, Yes/No, dates - one per column.
+  Active filters show as chips above the results; click a chip's x to remove it.
+* Details panel on the right shows every field of the selected connector.
+* Editing (off by default): click "Enable editing" in the top bar. You can then
+  add, edit, duplicate and delete connector rows. Every change is written to a
+  change log next to the database, and Ctrl+Z undoes your changes from this session.
 
-The database is opened read-only; this tool never changes it.
 Run with --demo to try it on built-in sample data (no Access driver needed).
 """
 import csv
 import datetime as dt
 import decimal
+import getpass
 import glob
 import json
 import os
 import re
+import shutil
 import struct
 import sys
+import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+from tkinter import font as tkfont
 
 APP_TITLE = "Adapter Lookup"
 if getattr(sys, "frozen", False):
@@ -36,12 +39,14 @@ else:
 SETTINGS_FILE = os.path.join(APP_DIR, "adapter_lookup_settings.json")
 MAX_ROWS = 20000         # most connector rows shown at once
 DISTINCT_LIMIT = 250     # columns with this many values or fewer get a pick-list
+COMMON_FILTERS = 8       # this many filters are always shown; the rest sit under "More filters"
 
 # ---- Settings for the SIGBOARDS database --------------------------------- #
 DEFAULT_DB = r"Z:\Engineering\Test Engineering\Test\Test Board DB\SIGBOARDS.mdb"  # used when none is saved
 DEFAULT_TABLE = "CONNECTORS"     # the only table used when it exists
 GROUP_COLUMN = "BOARD/ADAPTER"   # one adapter = all rows with the same value here
 PART_COLUMN = "CONNECTOR P/N"    # the connector part number
+REQUIRED_COLUMNS = [GROUP_COLUMN, PART_COLUMN]   # must be filled in when adding / editing
 # A row counts as scrapped when one of these columns matches the text (any case).
 SCRAP_RULES = [("Port", "SCRAP"), ("Category", "SCRAPPED")]
 # Order of the result columns and of the filters (other columns go after).
@@ -53,7 +58,8 @@ FILTER_ORDER = ["BOARD/ADAPTER", "CONNECTOR P/N", "DESCRIPTION", "Positions", "C
                 "Contact Type", "Housing Type", "Series", "Arrangement", "Shell", "Keying",
                 "Pitch", "Manufacturer", "CUSTOMER", "Relevant Assemblies", "LOCATION",
                 "Port", "OBSOLETE", "Voltage Rating", "Qty"]
-FRIENDLY_LABELS = {"Positions": "Positions (pins)"}
+FRIENDLY_LABELS = {"Positions": "Positions (pins)", "BOARD/ADAPTER": "Adapter / board",
+                   "CONNECTOR P/N": "Connector P/N"}
 PLACEHOLDERS = {"", "-", "--", "?", "??"}  # left out of pick-lists
 
 # Filters for columns whose names contain these words are listed first.
@@ -64,11 +70,22 @@ PRIORITY_HINTS = ["part", "pn", "sku", "model", "connector", "interface", "type"
 TEXT_TYPES = {"VARCHAR", "CHAR", "TEXT", "WVARCHAR", "WCHAR", "NVARCHAR", "NCHAR",
               "LONGCHAR", "MEMO", "WLONGVARCHAR", "LONGVARCHAR", "HYPERLINK", "GUID"}
 LONG_TEXT_TYPES = {"LONGCHAR", "MEMO", "WLONGVARCHAR", "LONGVARCHAR", "HYPERLINK"}
-NUMBER_TYPES = {"INTEGER", "INT", "SMALLINT", "BYTE", "TINYINT", "COUNTER", "BIGINT",
-                "DOUBLE", "REAL", "FLOAT", "CURRENCY", "DECIMAL", "NUMERIC", "MONEY"}
+INT_TYPES = {"INTEGER", "INT", "SMALLINT", "BYTE", "TINYINT", "COUNTER", "BIGINT"}
+NUMBER_TYPES = INT_TYPES | {"DOUBLE", "REAL", "FLOAT", "CURRENCY", "DECIMAL", "NUMERIC",
+                            "MONEY"}
 DATE_TYPES = {"DATETIME", "DATE", "TIMESTAMP", "TIME"}
 BOOL_TYPES = {"BIT", "BOOLEAN", "YESNO"}
 BINARY_TYPES = {"LONGBINARY", "VARBINARY", "BINARY", "IMAGE", "OLEOBJECT", "BLOB"}
+
+# ---- Look ------------------------------------------------------------------ #
+C = dict(
+    bg="#f3f5f8", surface="#ffffff", border="#d8dee6", text="#1d2733", muted="#6a7684",
+    faint="#9aa5b1", primary="#2a5ea8", primary_dark="#1e4682", primary_light="#e8eff9",
+    header="#1c3557", header_text="#ffffff", header_sub="#b9c8dc", header_btn="#2c4b74",
+    heading="#eef1f5", match="#fff3c7", group="#e5edf8", alt="#f8fafc", danger="#b42318",
+    danger_light="#fdecea", edit="#b45309", edit_light="#fff4e0", ok="#1f7a4d",
+    chip="#e3ecf8", chip_text="#1e4682",
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -108,6 +125,10 @@ def order_index(name, order):
 def clean_text(v):
     """Collapse line breaks / repeated spaces that are stored in some cells."""
     return " ".join(str(v).split())
+
+
+def label_for(name):
+    return FRIENDLY_LABELS.get(name, name)
 
 
 def priority(name):
@@ -171,12 +192,19 @@ def sort_key(v):
         return (1, s.lower())
 
 
+def plural(n, word, many=None):
+    return f"{n:,} {word if n == 1 else (many or word + 's')}"
+
+
 class Column:
-    def __init__(self, name, type_name):
+    def __init__(self, name, type_name, size=None):
         self.name = name
         self.type_name = (type_name or "").upper()
         self.kind = classify(type_name)
         self.long_text = self.type_name in LONG_TEXT_TYPES
+        self.is_int = self.type_name.split("(")[0] in INT_TYPES
+        self.size = size if (self.kind == "text" and not self.long_text and size
+                             and size < 100000) else None
 
     def __repr__(self):
         return f"Column({self.name!r}, {self.kind})"
@@ -247,7 +275,7 @@ def build_query(table, columns, quick_text="", quick_column=None, filters=(),
 class AccessBackend:
     concat = "&"
 
-    def __init__(self, path):
+    def __init__(self, path, writable=False):
         try:
             import pyodbc
         except ImportError:
@@ -266,8 +294,10 @@ class AccessBackend:
                 "install (64-bit Office -> 64-bit Python).")
         driver = next((d for d in drivers if "accdb" in d), drivers[0])
         self.path = path
-        self.conn = pyodbc.connect(
-            f"DRIVER={{{driver}}};DBQ={path};ReadOnly=1;", autocommit=True)
+        self.writable = writable
+        conn_str = f"DRIVER={{{driver}}};DBQ={path};" + ("" if writable else "ReadOnly=1;")
+        # Writes run in a transaction so a failed change is rolled back.
+        self.conn = pyodbc.connect(conn_str, autocommit=not writable)
 
     def date_param(self, d):
         return d
@@ -300,13 +330,39 @@ class AccessBackend:
             name = types.get(d[1])
             if name is None:   # text: over 255 characters means a Memo / Long Text field
                 name = "LONGCHAR" if (d[3] or 0) > 255 else "VARCHAR"
-            out.append(Column(d[0], name))
+            out.append(Column(d[0], name, d[3]))
         return out
+
+    def unique_key(self, table):
+        """Columns of the table's primary key / first unique index, or None."""
+        try:
+            idx = {}
+            for r in self.conn.cursor().statistics(table, unique=True):
+                if r.index_name and r.column_name:
+                    idx.setdefault(r.index_name, []).append((r.ordinal_position or 0,
+                                                             r.column_name))
+            if not idx:
+                return None
+            name = "PrimaryKey" if "PrimaryKey" in idx else sorted(idx)[0]
+            return [c for _, c in sorted(idx[name])]
+        except Exception:
+            return None
 
     def execute(self, sql, params=()):
         cur = self.conn.cursor()
         cur.execute(sql, params)
         return cur
+
+    def commit(self):
+        if self.writable:
+            self.conn.commit()
+
+    def rollback(self):
+        if self.writable:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
 
     def close(self):
         try:
@@ -319,9 +375,10 @@ class SqliteBackend:
     """Used for --demo and for testing; mirrors the Access back-end."""
     concat = "||"
 
-    def __init__(self, path):
+    def __init__(self, path, writable=False):
         import sqlite3
         self.path = path
+        self.writable = writable
         self.conn = sqlite3.connect(path)
 
     def date_param(self, d):
@@ -340,49 +397,227 @@ class SqliteBackend:
 
     def columns(self, table):
         rows = self.conn.execute(f"PRAGMA table_info({qi(table)})").fetchall()
-        return [Column(r[1], r[2]) for r in rows]
+        out = []
+        for r in rows:
+            m = re.search(r"\((\d+)\)", r[2] or "")
+            out.append(Column(r[1], r[2], int(m.group(1)) if m else None))
+        return out
+
+    def unique_key(self, table):
+        return None
 
     def execute(self, sql, params=()):
         return self.conn.execute(sql, list(params))
+
+    def commit(self):
+        self.conn.commit()
+
+    def rollback(self):
+        self.conn.rollback()
 
     def close(self):
         self.conn.close()
 
 
+def open_backend(path, sqlite=False, writable=False):
+    return SqliteBackend(path, writable) if sqlite else AccessBackend(path, writable)
+
+
+# --------------------------------------------------------------------------- #
+#  Writing changes
+# --------------------------------------------------------------------------- #
+class WriteError(Exception):
+    pass
+
+
+class RecordStore:
+    """Adds, changes and deletes single rows.
+
+    The CONNECTORS table has no ID column, so a row is found by matching every
+    one of its values (or the table's unique key, if it has one). A change is
+    only made when exactly one row matches, so nothing else is touched.
+    """
+
+    def __init__(self, backend, table, columns):
+        self.backend = backend
+        self.table = table
+        self.columns = [c for c in columns if c.kind != "binary"]
+        names = {c.name for c in self.columns}
+        key = backend.unique_key(table)
+        self.key_cols = key if key and all(k in names for k in key) else None
+
+    def _where(self, values):
+        cols = [c for c in self.columns if c.name in values and not c.long_text]
+        if self.key_cols and all(values.get(k) is not None for k in self.key_cols):
+            cols = [c for c in cols if c.name in self.key_cols]
+        where, params = [], []
+        for c in cols:
+            v, q = values[c.name], qi(c.name)
+            if v is None:
+                where.append(f"{q} IS NULL")
+            elif c.kind == "bool":
+                where.append(f"{q} <> 0" if v else f"{q} = 0")
+            elif isinstance(v, float) and not v.is_integer():
+                where.append(f"Abs({q} - ?) < 0.000001")
+                params.append(v)
+            else:
+                where.append(f"{q} = ?")
+                params.append(v)
+        if not where:
+            raise WriteError("This row has no values that can be used to find it.")
+        return " AND ".join(where), params
+
+    def count(self, values):
+        w, p = self._where(values)
+        return self.backend.execute(f"SELECT COUNT(*) FROM {qi(self.table)} WHERE {w}",
+                                    p).fetchone()[0]
+
+    def _find_one(self, values):
+        n = self.count(values)
+        if n == 0:
+            raise WriteError("This row couldn't be found. It may have just been changed or "
+                             "deleted by someone else.\n\nPress F5 to reload, then try again.")
+        if n > 1:
+            raise WriteError(f"There are {n} identical copies of this row, so it can't be "
+                             "changed on its own from here. Change one of them in Access, "
+                             "or delete the extra copies there.")
+
+    def _run(self, sql, params):
+        try:
+            cur = self.backend.execute(sql, params)
+            if cur.rowcount not in (1, -1):
+                raise WriteError(f"Expected to change 1 row but {cur.rowcount} would change. "
+                                 "Nothing was saved.")
+            self.backend.commit()
+        except WriteError:
+            self.backend.rollback()
+            raise
+        except Exception as e:
+            self.backend.rollback()
+            raise WriteError(f"The database refused the change:\n\n{e}")
+
+    def insert(self, values):
+        values = {c.name: values.get(c.name) for c in self.columns}
+        if not self.key_cols and self.count(values):
+            raise WriteError("An identical row already exists. Change at least one field "
+                             "(for example Qty or LOCATION) so the two rows can be told apart.")
+        names = [c.name for c in self.columns]
+        sql = (f"INSERT INTO {qi(self.table)} (" + ", ".join(qi(n) for n in names) +
+               ") VALUES (" + ", ".join("?" for _ in names) + ")")
+        self._run(sql, [values[n] for n in names])
+        return values
+
+    def update(self, before, changes):
+        changes = {k: v for k, v in changes.items() if before.get(k) != v}
+        if not changes:
+            return dict(before)
+        self._find_one(before)
+        after = dict(before)
+        after.update(changes)
+        if not self.key_cols and self.count(after):
+            raise WriteError("Another row already has exactly these values. Change at "
+                             "least one more field so the two rows can be told apart.")
+        w, p = self._where(before)
+        sets = ", ".join(f"{qi(k)} = ?" for k in changes)
+        self._run(f"UPDATE {qi(self.table)} SET {sets} WHERE {w}",
+                  list(changes.values()) + p)
+        return after
+
+    def delete(self, before):
+        self._find_one(before)
+        w, p = self._where(before)
+        self._run(f"DELETE FROM {qi(self.table)} WHERE {w}", p)
+
+
+class ChangeLog:
+    """Appends one line per change to a CSV next to the database."""
+    FIELDS = ["When", "User", "Action", "Adapter", "Connector P/N", "Details"]
+
+    def __init__(self, db_path):
+        base = os.path.splitext(os.path.basename(db_path))[0]
+        self.paths = [os.path.join(os.path.dirname(os.path.abspath(db_path)),
+                                   f"{base}_change_log.csv"),
+                      os.path.join(APP_DIR, f"{base}_change_log.csv")]
+        self.path = self.paths[0]
+
+    @staticmethod
+    def user():
+        try:
+            return os.environ.get("USERNAME") or getpass.getuser()
+        except Exception:
+            return "unknown"
+
+    def write(self, action, adapter, part, details):
+        row = [dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), self.user(), action,
+               adapter, part, details]
+        for path in self.paths:
+            try:
+                new = not os.path.exists(path)
+                with open(path, "a", newline="", encoding="utf-8-sig") as f:
+                    w = csv.writer(f)
+                    if new:
+                        w.writerow(self.FIELDS)
+                    w.writerow(row)
+                self.path = path
+                return True
+            except Exception:
+                continue
+        return False
+
+
+def describe_values(values):
+    return "; ".join(f"{k}={fmt_value(v)}" for k, v in values.items() if fmt_value(v))
+
+
+def describe_changes(before, after):
+    return "; ".join(f"{k}: '{fmt_value(before.get(k))}' -> '{fmt_value(v)}'"
+                     for k, v in after.items() if before.get(k) != v)
+
+
+# --------------------------------------------------------------------------- #
+#  Demo data
+# --------------------------------------------------------------------------- #
 def make_demo_db(path):
+    """A small CONNECTORS table shaped like the real one."""
     import random
     import sqlite3
     if os.path.exists(path):
         os.remove(path)
     rnd = random.Random(7)
     conn = sqlite3.connect(path)
-    conn.execute("""CREATE TABLE Adapters (
-        ID INTEGER, PartNumber VARCHAR, Description VARCHAR, ConnectorA VARCHAR,
-        ConnectorB VARCHAR, InterfaceType VARCHAR, PinCount INTEGER, Gender VARCHAR,
-        Length_mm DOUBLE, Manufacturer VARCHAR, InStock BIT, DateAdded DATETIME,
-        Notes LONGCHAR)""")
-    conns = [("DB9", 9, "RS-232"), ("DB25", 25, "RS-232"), ("RJ45", 8, "Ethernet"),
-             ("USB-A", 4, "USB"), ("USB-C", 24, "USB"), ("M12", 8, "Ethernet"),
-             ("BNC", 1, "Coax"), ("SMA", 1, "Coax"), ("D-Sub 15", 15, "VGA"),
-             ("MIL-38999", 37, "Mil-Spec"), ("Micro-D 51", 51, "Mil-Spec"),
-             ("Terminal block", 6, "Discrete")]
-    mfrs = ["Amphenol", "TE Connectivity", "Molex", "Glenair", "L-com", "Startech"]
+    conn.execute("""CREATE TABLE CONNECTORS (
+        [BOARD/ADAPTER] VARCHAR(50), [CONNECTOR P/N] VARCHAR(50), Qty INTEGER,
+        DESCRIPTION VARCHAR(255), Positions INTEGER, Series VARCHAR(50),
+        Category VARCHAR(50), [Contact Type] VARCHAR(50), [Housing Type] VARCHAR(50),
+        Arrangement VARCHAR(50), Shell VARCHAR(50), Keying VARCHAR(50), Pitch VARCHAR(50),
+        Manufacturer VARCHAR(50), [Relevant Assemblies] VARCHAR(255), LOCATION VARCHAR(50),
+        OBSOLETE VARCHAR(10), Port VARCHAR(50), CUSTOMER VARCHAR(50),
+        [Voltage Rating] VARCHAR(50))""")
+    parts = [("D38999/26WD35SN", "Circular Military", 37, "Socket", "Circular", "D38999"),
+             ("D38999/20WB98PN", "Circular Military", 6, "Pin", "Circular", "D38999"),
+             ("DB25P", "D-Sub", 25, "Pin", "D-Sub", "--"),
+             ("DB25S", "D-Sub", 25, "Socket", "D-Sub", "--"),
+             ("DE9S", "D-Sub", 9, "Socket", "D-Sub", "--"),
+             ("M83513/04-C11N", "Micro-D", 37, "Socket", "Micro-D", "M83513"),
+             ("43025-1000", "Plastic Crimp Housing", 10, "Socket", "Plastic", "Micro-Fit"),
+             ("1-480698-0", "Plastic Crimp Housing", 4, "Pin", "Plastic", "Mate-N-Lok"),
+             ("SMA-J-P", "RF", 1, "Socket", "Coax", "SMA"),
+             ("BNC-FB", "RF", 1, "Socket", "Coax", "BNC")]
+    mfrs = ["Amphenol", "TE Connectivity", "Molex", "Glenair", "ITT Cannon"]
     rows = []
-    for i in range(1, 241):
-        a, b = rnd.sample(conns, 2)
-        if rnd.random() < .5:
-            b = (a[0], a[1], a[2])
-        pn = f"ADP-{a[0].split()[0].replace('-', '')[:4].upper()}-{1000 + i}"
-        rows.append((i, pn, f"{a[0]} to {b[0]} adapter", a[0], b[0], a[2], a[1],
-                     rnd.choice(["M-F", "F-F", "M-M"]),
-                     rnd.choice([None, 25.0, 50.0, 100.0, 150.0, 300.0]),
-                     rnd.choice(mfrs), rnd.random() < .7,
-                     (dt.date(2019, 1, 1) + dt.timedelta(days=rnd.randint(0, 2400))).isoformat(),
-                     rnd.choice(["", "", "Shielded", "Strain relief", "Rev B pinout"])))
-    conn.executemany("INSERT INTO Adapters VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
-    conn.execute("CREATE TABLE Vendors (VendorName VARCHAR, Phone VARCHAR, Website VARCHAR)")
-    conn.executemany("INSERT INTO Vendors VALUES (?,?,?)",
-                     [(m, "555-0100", m.lower().replace(" ", "") + ".com") for m in mfrs])
+    for i in range(1, 161):
+        adapter = rnd.choice([f"ADAPTER {i}", f"{94000 + i}-1", f"CS-{10100 + i}"])
+        scrapped = rnd.random() < .1
+        for _ in range(rnd.randint(1, 4)):
+            pn, cat, pos, ct, ht, ser = rnd.choice(parts)
+            rows.append((adapter, pn, rnd.choice([1, 1, 1, 2]),
+                         f"{pos} pos {cat.lower()} {ct.lower()}", pos, ser,
+                         "SCRAPPED" if scrapped and rnd.random() < .5 else cat, ct, ht,
+                         "--", "--", "--", "--", rnd.choice(mfrs), "--",
+                         f"Shelf {rnd.choice('ABCDE')}{rnd.randint(1, 9)}", "No",
+                         "SCRAP" if scrapped else f"J{rnd.randint(1, 8)}",
+                         rnd.choice(["--", "Boeing", "Raytheon", "Honeywell"]), "--"))
+    conn.executemany("INSERT INTO CONNECTORS VALUES (" + ",".join("?" * 20) + ")", rows)
     conn.commit()
     conn.close()
 
@@ -407,14 +642,19 @@ def save_settings(s):
 
 
 # --------------------------------------------------------------------------- #
-#  GUI
+#  Small widgets
 # --------------------------------------------------------------------------- #
+def wheel_step(event):
+    return -1 if (getattr(event, "num", 0) == 4 or getattr(event, "delta", 0) > 0) else 1
+
+
 class ScrollFrame(ttk.Frame):
-    def __init__(self, master, **kw):
-        super().__init__(master, **kw)
-        self.canvas = tk.Canvas(self, highlightthickness=0, borderwidth=0)
+    def __init__(self, master, style="Card.TFrame", **kw):
+        super().__init__(master, style=style, **kw)
+        bg = C["surface"] if style == "Card.TFrame" else C["bg"]
+        self.canvas = tk.Canvas(self, highlightthickness=0, borderwidth=0, background=bg)
         vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
-        self.inner = ttk.Frame(self.canvas)
+        self.inner = ttk.Frame(self.canvas, style=style)
         self.inner.bind("<Configure>",
                         lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
         self._win = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
@@ -423,70 +663,183 @@ class ScrollFrame(ttk.Frame):
         self.canvas.configure(yscrollcommand=vsb.set)
         self.canvas.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
-        self.bind_all("<MouseWheel>", self._wheel, add="+")
-        self.bind_all("<Button-4>", self._wheel, add="+")
-        self.bind_all("<Button-5>", self._wheel, add="+")
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.bind_all(seq, self._wheel, add="+")
 
-    def _wheel(self, event):
-        w = event.widget
+    def _inside(self, w):
         while w is not None:
             if w is self:
-                break
+                return True
             w = getattr(w, "master", None)
+        return False
+
+    def _wheel(self, event):
+        try:
+            if not self.winfo_exists() or not self._inside(event.widget):
+                return
+            self.canvas.yview_scroll(wheel_step(event), "units")
+        except tk.TclError:
+            pass
+
+    def wheel_and_stop(self, event):
+        """Bound on drop-down boxes so the wheel scrolls the panel, not the value."""
+        self.canvas.yview_scroll(wheel_step(event), "units")
+        return "break"
+
+    def protect(self, widget):
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            widget.bind(seq, self.wheel_and_stop)
+
+
+class Tooltip:
+    def __init__(self, widget, text):
+        self.widget, self.text, self.tip, self._job = widget, text, None, None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _):
+        self._job = self.widget.after(500, self._show)
+
+    def _show(self):
+        if self.tip or not self.text:
+            return
+        x = self.widget.winfo_rootx() + 8
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self.tip = tk.Toplevel(self.widget)
+        self.tip.wm_overrideredirect(True)
+        self.tip.wm_geometry(f"+{x}+{y}")
+        tk.Label(self.tip, text=self.text, background="#2b3440", foreground="white",
+                 padx=8, pady=4, justify="left", wraplength=320).pack()
+
+    def _hide(self, _=None):
+        if self._job:
+            self.widget.after_cancel(self._job)
+            self._job = None
+        if self.tip:
+            self.tip.destroy()
+            self.tip = None
+
+
+class Placeholder:
+    """Grey hint text shown inside an empty entry."""
+
+    def __init__(self, entry, var, text):
+        self.entry, self.var = entry, var
+        self.label = tk.Label(entry, text=text, background=C["surface"],
+                              foreground=C["faint"], cursor="xterm",
+                              font=entry.cget("font") or None)
+        self.label.bind("<Button-1>", lambda e: entry.focus_set())
+        var.trace_add("write", lambda *_: self.update())
+        entry.bind("<FocusIn>", lambda e: self.update(), add="+")
+        entry.bind("<FocusOut>", lambda e: self.update(), add="+")
+        entry.after(10, self.update)
+
+    def update(self):
+        if self.var.get():
+            self.label.place_forget()
         else:
-            return
-        if isinstance(event.widget, ttk.Combobox):
-            return
-        step = -1 if (getattr(event, "num", 0) == 4 or getattr(event, "delta", 0) > 0) else 1
-        self.canvas.yview_scroll(step, "units")
+            self.label.place(x=6, rely=0.5, anchor="w")
 
 
+def link(parent, text, command, color=None, bg=None, font=None):
+    """A clickable text label."""
+    lbl = tk.Label(parent, text=text, foreground=color or C["primary"],
+                   background=bg or C["surface"], cursor="hand2", font=font)
+    lbl.bind("<Button-1>", lambda e: command())
+    return lbl
+
+
+# --------------------------------------------------------------------------- #
+#  Filters
+# --------------------------------------------------------------------------- #
 class FilterRow:
-    """One filter in the left panel."""
+    """One filter in the left panel: a label with an input under it."""
 
-    def __init__(self, app, parent, col, distinct, row):
+    def __init__(self, app, parent, col, distinct):
+        self.app = app
         self.col = col
         self.vars = []
-        self.choices = set()
-        label = ttk.Label(parent, text=FRIENDLY_LABELS.get(col.name, col.name), anchor="w")
-        label.grid(row=row, column=0, sticky="w", padx=(4, 6), pady=2)
-        cell = ttk.Frame(parent)
-        cell.grid(row=row, column=1, sticky="ew", padx=(0, 4), pady=2)
-        if col.kind == "text":
-            cell.columnconfigure(0, weight=1)
+        self.choices = {}
+        self.widgets = []
+        self.frame = ttk.Frame(parent, style="Card.TFrame")
+        self.frame.pack(fill="x", padx=12, pady=(0, 10))
+        top = ttk.Frame(self.frame, style="Card.TFrame")
+        top.pack(fill="x")
+        ttk.Label(top, text=label_for(col.name), style="FieldLabel.TLabel").pack(side="left")
+        self.clear_link = link(top, "clear", self._clear_and_search, color=C["faint"],
+                               font=app.f_small)
+        cell = ttk.Frame(self.frame, style="Card.TFrame")
+        cell.pack(fill="x", pady=(3, 0))
 
         if col.kind == "bool":
             v = tk.StringVar(value="Any")
             cb = ttk.Combobox(cell, textvariable=v, values=["Any", "Yes", "No"],
                               state="readonly", width=8)
-            cb.grid(row=0, column=0, sticky="w")
+            cb.pack(side="left")
             cb.bind("<<ComboboxSelected>>", lambda e: app.run_search())
             self.vars = [v]
+            self.widgets = [cb]
         elif col.kind in ("number", "date"):
             lo, hi = tk.StringVar(), tk.StringVar()
-            w = 8 if col.kind == "number" else 11
+            w = 7 if col.kind == "number" else 11
             e1 = ttk.Entry(cell, textvariable=lo, width=w)
             e2 = ttk.Entry(cell, textvariable=hi, width=w)
-            e1.grid(row=0, column=0, sticky="w")
-            ttk.Label(cell, text=" to ").grid(row=0, column=1)
-            e2.grid(row=0, column=2, sticky="w")
+            e1.pack(side="left", fill="x", expand=True)
+            ttk.Label(cell, text="  to  ", style="CardMuted.TLabel").pack(side="left")
+            e2.pack(side="left", fill="x", expand=True)
+            Placeholder(e1, lo, "min" if col.kind == "number" else "from")
+            Placeholder(e2, hi, "max" if col.kind == "number" else "to")
             for e in (e1, e2):
                 e.bind("<Return>", lambda ev: app.run_search())
-            if col.kind == "date":
-                ttk.Label(cell, text="YYYY-MM-DD", foreground="gray").grid(
-                    row=1, column=0, columnspan=3, sticky="w")
+                e.bind("<KeyRelease>", app.schedule_search, add="+")
             self.vars = [lo, hi]
+            self.widgets = [e1, e2]
         else:
             v = tk.StringVar()
             if distinct is not None:
-                self.choices = {d.lower() for d in distinct}
+                self.choices = {d.lower(): d for d in distinct}
                 w = ttk.Combobox(cell, textvariable=v, values=[""] + distinct)
                 w.bind("<<ComboboxSelected>>", lambda e: app.run_search())
+                Placeholder(w, v, "Any")
             else:
                 w = ttk.Entry(cell, textvariable=v)
-            w.grid(row=0, column=0, sticky="ew")
+                Placeholder(w, v, "contains...")
+            w.pack(fill="x")
             w.bind("<Return>", lambda e: app.run_search())
+            w.bind("<KeyRelease>", app.schedule_search, add="+")
             self.vars = [v]
+            self.widgets = [w]
+        for var in self.vars:
+            var.trace_add("write", lambda *_: self._show_clear())
+        for w in self.widgets:
+            app.filter_scroll.protect(w)
+
+    def _show_clear(self):
+        if self.is_active():
+            self.clear_link.pack(side="right")
+        else:
+            self.clear_link.pack_forget()
+
+    def _clear_and_search(self):
+        self.clear()
+        self.app.run_search()
+
+    def add_choice(self, value):
+        """Make a newly saved value appear in this pick-list."""
+        if not self.choices or value in (None, "") or not isinstance(value, str):
+            return
+        text = clean_text(value)
+        if text in PLACEHOLDERS or text.lower() in self.choices:
+            return
+        self.choices[text.lower()] = text
+        values = sorted(self.choices.values(), key=sort_key)
+        self.widgets[0].configure(values=[""] + values)
+
+    def is_active(self):
+        if self.col.kind == "bool":
+            return self.vars[0].get() != "Any"
+        return any(v.get().strip() for v in self.vars)
 
     def clear(self):
         if self.col.kind == "bool":
@@ -494,6 +847,20 @@ class FilterRow:
         else:
             for v in self.vars:
                 v.set("")
+
+    def chip_text(self):
+        name = label_for(self.col.name)
+        if self.col.kind == "bool":
+            return f"{name}: {self.vars[0].get()}"
+        if self.col.kind in ("number", "date"):
+            lo, hi = (v.get().strip() for v in self.vars)
+            if lo and hi:
+                return f"{name}: {lo} to {hi}"
+            return f"{name} \u2265 {lo}" if lo else f"{name} \u2264 {hi}"
+        text = self.vars[0].get().strip()
+        if clean_text(text).lower() in self.choices and "*" not in text:
+            return f"{name}: {text}"
+        return f"{name} contains \u201c{text}\u201d"
 
     def conditions(self):
         """Return list of (Column, op, value); raises ValueError on bad input."""
@@ -508,8 +875,8 @@ class FilterRow:
                 try:
                     val = parse(var.get())
                 except ValueError as e:
-                    raise ValueError(f"{c.name}: {e}" if c.kind == "date"
-                                     else f"{c.name}: '{var.get()}' is not a number")
+                    raise ValueError(f"{label_for(c.name)}: {e}" if c.kind == "date"
+                                     else f"{label_for(c.name)}: '{var.get()}' is not a number")
                 if val is not None:
                     out.append((c, op, val))
             return out
@@ -521,18 +888,245 @@ class FilterRow:
         return [(c, "contains", text)]
 
 
+# --------------------------------------------------------------------------- #
+#  Add / edit form
+# --------------------------------------------------------------------------- #
+class RecordDialog(tk.Toplevel):
+    """Form for adding or editing one connector row. Calls on_save(values) -> bool."""
+
+    def __init__(self, app, title, columns, values, pick_lists, on_save, intro=""):
+        super().__init__(app)
+        self.app = app
+        self.columns = columns
+        self.on_save = on_save
+        self.original = dict(values)
+        self.pick_lists = pick_lists
+        self.inputs = {}
+        self.labels = {}
+        self.title(title)
+        self.configure(background=C["bg"])
+        self.transient(app)
+        self.geometry("780x700")
+        self.minsize(560, 420)
+
+        head = ttk.Frame(self, style="TFrame", padding=(20, 16, 20, 8))
+        head.pack(fill="x")
+        ttk.Label(head, text=title, style="DialogTitle.TLabel").pack(anchor="w")
+        if intro:
+            ttk.Label(head, text=intro, style="Muted.TLabel", wraplength=720,
+                      justify="left").pack(anchor="w", pady=(4, 0))
+
+        foot = ttk.Frame(self, style="TFrame", padding=(20, 10, 20, 16))
+        foot.pack(fill="x", side="bottom")
+        self.error = ttk.Label(foot, text="", style="Error.TLabel", wraplength=480,
+                               justify="left")
+        self.error.pack(side="left", fill="x", expand=True)
+        ttk.Button(foot, text="Cancel", command=self.destroy).pack(side="right")
+        self.save_btn = ttk.Button(foot, text="Save", style="Accent.TButton",
+                                   command=self.save)
+        self.save_btn.pack(side="right", padx=(0, 8))
+
+        card = ttk.Frame(self, style="Card.TFrame")
+        card.pack(fill="both", expand=True, padx=20)
+        self.scroll = ScrollFrame(card)
+        self.scroll.pack(fill="both", expand=True, padx=1, pady=1)
+        grid = self.scroll.inner
+        grid.columnconfigure(0, weight=1, uniform="f")
+        grid.columnconfigure(1, weight=1, uniform="f")
+
+        r = c = 0
+        for col in columns:
+            wide = col.long_text or col.name.upper() in ("DESCRIPTION", "RELEVANT ASSEMBLIES")
+            if wide and c == 1:
+                r, c = r + 1, 0
+            cell = ttk.Frame(grid, style="Card.TFrame")
+            cell.grid(row=r, column=c, columnspan=2 if wide else 1, sticky="ew",
+                      padx=14, pady=(12 if r == 0 else 4, 6))
+            req = col.name in REQUIRED_COLUMNS
+            text = label_for(col.name) + (" *" if req else "")
+            lbl = ttk.Label(cell, text=text, style="FieldLabel.TLabel")
+            lbl.pack(anchor="w")
+            self.labels[col.name] = lbl
+            self.inputs[col.name] = self._make_input(cell, col, values.get(col.name))
+            hint = self._hint(col)
+            if hint:
+                ttk.Label(cell, text=hint, style="Hint.TLabel").pack(anchor="w")
+            if wide:
+                r, c = r + 1, 0
+            else:
+                r, c = (r, 1) if c == 0 else (r + 1, 0)
+
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.bind("<Control-s>", lambda e: self.save())
+        self.bind("<Control-Return>", lambda e: self.save())
+        self.after(50, self._focus_first)
+        self.after(100, self._grab)
+
+    def _grab(self):
+        try:
+            self.grab_set()
+        except tk.TclError:
+            pass
+
+    def _hint(self, col):
+        bits = []
+        if col.kind == "number":
+            bits.append("whole number" if col.is_int else "number")
+        elif col.kind == "date":
+            bits.append("YYYY-MM-DD")
+        if col.size and col.size < 255:
+            bits.append(f"up to {col.size} characters")
+        if col.name in self.pick_lists:
+            bits.append("pick or type a new value")
+        return ", ".join(bits)
+
+    def _make_input(self, parent, col, value):
+        if col.kind == "bool":
+            var = tk.BooleanVar(value=bool(value))
+            ttk.Checkbutton(parent, text="Yes", variable=var,
+                            style="Card.TCheckbutton").pack(anchor="w", pady=(2, 0))
+            return ("bool", var)
+        if col.long_text:
+            t = tk.Text(parent, height=3, wrap="word", relief="solid", borderwidth=1,
+                        font=self.app.f_base, highlightthickness=0)
+            t.configure(highlightbackground=C["border"])
+            t.insert("1.0", "" if value is None else str(value))
+            t.pack(fill="x", pady=(3, 0))
+            return ("text", t)
+        var = tk.StringVar(value=fmt_value(value) if col.kind != "text" else
+                           ("" if value is None else str(value).replace("\r", " ")
+                            .replace("\n", " ")))
+        if col.name in self.pick_lists:
+            w = ttk.Combobox(parent, textvariable=var, values=self.pick_lists[col.name])
+            self.scroll.protect(w)
+        else:
+            w = ttk.Entry(parent, textvariable=var)
+        w.pack(fill="x", pady=(3, 0))
+        var.trace_add("write", lambda *_: self._mark_changed(col.name))
+        return ("var", var)
+
+    def _mark_changed(self, name):
+        try:
+            changed = self._value_text(name) != self._orig_text(name)
+        except Exception:
+            changed = False
+        self.labels[name].configure(style="FieldLabelChanged.TLabel" if changed
+                                    else "FieldLabel.TLabel")
+
+    def _orig_text(self, name):
+        """The original value as the form shows it."""
+        v = self.original.get(name)
+        col = next(c for c in self.columns if c.name == name)
+        if v is None:
+            return ""
+        if col.kind != "text":
+            return fmt_value(v)
+        return str(v).strip() if col.long_text else clean_text(v)
+
+    def _value_text(self, name):
+        kind, w = self.inputs[name]
+        if kind == "bool":
+            return "Yes" if w.get() else "No"
+        if kind == "text":
+            return w.get("1.0", "end-1c").strip()
+        return clean_text(w.get())
+
+    def _focus_first(self):
+        for child in self.scroll.inner.winfo_children():
+            for sub in child.winfo_children():
+                if isinstance(sub, (ttk.Entry, ttk.Combobox)):
+                    if not sub.get():
+                        sub.focus_set()
+                        return
+        self.save_btn.focus_set()
+
+    def collect(self):
+        """Return {column: value} converted to database types; raises ValueError."""
+        out, problems = {}, []
+        for col in self.columns:
+            kind, w = self.inputs[col.name]
+            name = label_for(col.name)
+            if kind == "bool":
+                out[col.name] = bool(w.get())
+                continue
+            text = (w.get("1.0", "end-1c").strip() if kind == "text"
+                    else clean_text(w.get()))
+            if not text and col.name in REQUIRED_COLUMNS:
+                problems.append(f"{name} is required.")
+                continue
+            if col.name in self.original and text == self._orig_text(col.name):
+                # Untouched: keep the stored value exactly as it is.
+                out[col.name] = self.original[col.name]
+                continue
+            if not text:
+                out[col.name] = None
+                continue
+            if col.kind == "number":
+                try:
+                    num = float(text.replace(",", ""))
+                except ValueError:
+                    problems.append(f"{name} must be a number.")
+                    continue
+                if col.is_int:
+                    if not num.is_integer():
+                        problems.append(f"{name} must be a whole number.")
+                        continue
+                    num = int(num)
+                out[col.name] = num
+            elif col.kind == "date":
+                try:
+                    out[col.name] = parse_date(text)
+                except ValueError as e:
+                    problems.append(f"{name}: {e}")
+            else:
+                text = " ".join(text.split()) if not col.long_text else text
+                # Use the existing spelling when only the capitalisation differs,
+                # so the data doesn't gain another "CIRCULAR Military" variant.
+                known = {v.lower(): v for v in self.pick_lists.get(col.name, [])}
+                text = known.get(text.lower(), text)
+                if col.size and len(text) > col.size:
+                    problems.append(f"{name} is {len(text)} characters long; "
+                                    f"the most it can hold is {col.size}.")
+                out[col.name] = text
+        if problems:
+            raise ValueError("\n".join(problems))
+        return out
+
+    def save(self):
+        try:
+            values = self.collect()
+        except ValueError as e:
+            self.error.configure(text=str(e))
+            self.bell()
+            return
+        self.error.configure(text="")
+        if self.on_save(values, self):
+            self.destroy()
+
+    def show_error(self, text):
+        self.error.configure(text=text)
+        self.bell()
+
+
+# --------------------------------------------------------------------------- #
+#  Main window
+# --------------------------------------------------------------------------- #
 class App(tk.Tk):
     def __init__(self, db_path=None, demo=False):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("1360x800")
-        self.minsize(900, 500)
+        self.geometry("1440x860")
+        self.minsize(1000, 560)
+        self.configure(background=C["bg"])
         self.settings = load_settings()
         self.backend = None
+        self.db_path = None
+        self.is_sqlite = False
         self.table_map = {}
         self.columns = []
         self.group_col = None
         self.filter_rows = []
+        self.pick_lists = {}
         self.result_cols = []
         self.rows = []            # flat mode: matched rows
         self.groups = []          # grouped mode: [(adapter, [(row, matched), ...])]
@@ -541,17 +1135,134 @@ class App(tk.Tk):
         self.sort_state = (None, False)
         self._after_id = None
         self.demo = demo
+        self.editing = False
+        self.store = None
+        self.log = None
+        self.undo_stack = []      # [(action, before, after)]
+        self.backed_up = False
 
-        style = ttk.Style(self)
-        if "vista" in style.theme_names():
-            style.theme_use("vista")
-        elif "clam" in style.theme_names():
-            style.theme_use("clam")
-        style.configure("Treeview", rowheight=22)
-
+        self._setup_style()
         self._build_menu()
         self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self.quit_app)
         self.after(50, lambda: self._startup(db_path))
+
+    # ---------- look ----------
+    def _setup_style(self):
+        families = set(tkfont.families(self))
+        fam = next((f for f in ("Segoe UI", "Inter", "Helvetica Neue", "DejaVu Sans")
+                    if f in families), tkfont.nametofont("TkDefaultFont").actual("family"))
+        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
+            try:
+                tkfont.nametofont(name).configure(family=fam, size=10)
+            except tk.TclError:
+                pass
+        self.f_base = (fam, 10)
+        self.f_small = (fam, 9)
+        self.f_bold = (fam, 10, "bold")
+        self.f_title = (fam, 15, "bold")
+        self.f_section = (fam, 11, "bold")
+        self.f_search = (fam, 12)
+        self._bold = tkfont.Font(self, family=fam, size=10, weight="bold")
+
+        s = ttk.Style(self)
+        s.theme_use("clam")
+        s.configure(".", background=C["bg"], foreground=C["text"], font=self.f_base,
+                    bordercolor=C["border"], lightcolor=C["surface"], darkcolor=C["border"],
+                    troughcolor=C["bg"], focuscolor=C["primary"])
+        s.configure("TFrame", background=C["bg"])
+        s.configure("Card.TFrame", background=C["surface"])
+        s.configure("Header.TFrame", background=C["header"])
+        s.configure("Banner.TFrame", background=C["edit_light"])
+        s.configure("TLabel", background=C["bg"], foreground=C["text"])
+        s.configure("Muted.TLabel", background=C["bg"], foreground=C["muted"])
+        s.configure("Card.TLabel", background=C["surface"])
+        s.configure("CardMuted.TLabel", background=C["surface"], foreground=C["muted"])
+        s.configure("Hint.TLabel", background=C["surface"], foreground=C["faint"],
+                    font=self.f_small)
+        s.configure("Section.TLabel", background=C["surface"], font=self.f_section)
+        s.configure("Count.TLabel", background=C["surface"], font=self.f_section)
+        s.configure("DetailTitle.TLabel", background=C["surface"], font=(self.f_base[0], 13,
+                                                                         "bold"))
+        s.configure("DialogTitle.TLabel", background=C["bg"], font=self.f_title)
+        s.configure("FieldLabel.TLabel", background=C["surface"], foreground=C["muted"],
+                    font=(self.f_base[0], 9, "bold"))
+        s.configure("FieldLabelChanged.TLabel", background=C["surface"],
+                    foreground=C["edit"], font=(self.f_base[0], 9, "bold"))
+        s.configure("Error.TLabel", background=C["bg"], foreground=C["danger"])
+        s.configure("HeaderTitle.TLabel", background=C["header"],
+                    foreground=C["header_text"], font=self.f_title)
+        s.configure("HeaderSub.TLabel", background=C["header"], foreground=C["header_sub"])
+        s.configure("Banner.TLabel", background=C["edit_light"], foreground=C["edit"])
+        s.configure("Status.TLabel", background=C["surface"], foreground=C["muted"],
+                    padding=(12, 5))
+
+        s.configure("TButton", background=C["surface"], foreground=C["text"],
+                    bordercolor=C["border"], lightcolor=C["surface"], darkcolor=C["surface"],
+                    padding=(12, 5), relief="flat", focusthickness=0)
+        s.map("TButton", background=[("disabled", C["bg"]), ("pressed", C["heading"]),
+                                     ("active", C["primary_light"])],
+              foreground=[("disabled", C["faint"])],
+              bordercolor=[("active", C["primary"])])
+        s.configure("Accent.TButton", background=C["primary"], foreground="white",
+                    bordercolor=C["primary"], lightcolor=C["primary"],
+                    darkcolor=C["primary"], font=self.f_bold)
+        s.map("Accent.TButton",
+              background=[("disabled", "#a9bbd6"), ("pressed", C["primary_dark"]),
+                          ("active", C["primary_dark"])],
+              foreground=[("disabled", "white")],
+              bordercolor=[("active", C["primary_dark"])])
+        s.configure("Danger.TButton", foreground=C["danger"])
+        s.map("Danger.TButton", background=[("disabled", C["bg"]),
+                                            ("active", C["danger_light"])],
+              bordercolor=[("active", C["danger"])], foreground=[("disabled", C["faint"])])
+        s.configure("Header.TButton", background=C["header_btn"], foreground="white",
+                    bordercolor=C["header_btn"], lightcolor=C["header_btn"],
+                    darkcolor=C["header_btn"], padding=(14, 6))
+        s.map("Header.TButton", background=[("active", "#3a5f90")],
+              bordercolor=[("active", "#3a5f90")])
+        s.configure("EditOn.TButton", background="#d97706", foreground="white",
+                    bordercolor="#d97706", lightcolor="#d97706", darkcolor="#d97706",
+                    padding=(14, 6), font=self.f_bold)
+        s.map("EditOn.TButton", background=[("active", "#b45309")],
+              bordercolor=[("active", "#b45309")])
+
+        for w in ("TEntry", "TCombobox"):
+            s.configure(w, fieldbackground=C["surface"], bordercolor=C["border"],
+                        lightcolor=C["surface"], darkcolor=C["surface"], padding=(6, 4),
+                        arrowcolor=C["muted"], insertcolor=C["text"])
+            s.map(w, bordercolor=[("focus", C["primary"])],
+                  lightcolor=[("focus", C["primary"])],
+                  fieldbackground=[("readonly", C["surface"])])
+        s.configure("Search.TEntry", padding=(10, 7))
+        self.option_add("*TCombobox*Listbox.font", self.f_base)
+        self.option_add("*TCombobox*Listbox.selectBackground", C["primary"])
+
+        for w in ("TCheckbutton", "Card.TCheckbutton"):
+            s.configure(w, background=C["bg"] if w == "TCheckbutton" else C["surface"],
+                        indicatorbackground=C["surface"], indicatorforeground=C["primary"],
+                        focusthickness=0)
+            s.map(w, background=[("active", C["bg"] if w == "TCheckbutton"
+                                  else C["surface"])],
+                  indicatorbackground=[("selected", C["surface"])])
+
+        s.configure("Treeview", background=C["surface"], fieldbackground=C["surface"],
+                    foreground=C["text"], rowheight=26, borderwidth=0, relief="flat")
+        s.map("Treeview", background=[("selected", C["primary"])],
+              foreground=[("selected", "white")])
+        s.configure("Treeview.Heading", background=C["heading"], foreground=C["muted"],
+                    font=(self.f_base[0], 9, "bold"), relief="flat", padding=(8, 6),
+                    bordercolor=C["border"], lightcolor=C["heading"], darkcolor=C["border"])
+        s.map("Treeview.Heading", background=[("active", "#e2e7ee")])
+        s.configure("Details.Treeview", rowheight=24)
+        s.configure("TPanedwindow", background=C["bg"])
+        s.configure("Sash", sashthickness=8, gripcount=0, background=C["bg"])
+        s.configure("Vertical.TScrollbar", background="#cfd6df", troughcolor=C["surface"],
+                    bordercolor=C["surface"], lightcolor="#cfd6df", darkcolor="#cfd6df",
+                    arrowcolor=C["muted"], gripcount=0)
+        s.configure("Horizontal.TScrollbar", background="#cfd6df", troughcolor=C["surface"],
+                    bordercolor=C["surface"], lightcolor="#cfd6df", darkcolor="#cfd6df",
+                    arrowcolor=C["muted"], gripcount=0)
 
     # ---------- layout ----------
     def _build_menu(self):
@@ -562,102 +1273,275 @@ class App(tk.Tk):
         f.add_separator()
         f.add_command(label="Export results to CSV...", command=self.export_csv,
                       accelerator="Ctrl+E")
+        f.add_command(label="Back up database now...", command=self.backup_db)
         f.add_separator()
-        f.add_command(label="Exit", command=self.destroy)
+        f.add_command(label="Exit", command=self.quit_app)
         m.add_cascade(label="File", menu=f)
+
+        e = tk.Menu(m, tearoff=False)
+        e.add_command(label="Turn editing on / off", command=self.toggle_edit)
+        e.add_separator()
+        e.add_command(label="New connector...", command=self.new_record, accelerator="Ctrl+N")
+        e.add_command(label="Edit selected...", command=self.edit_selected, accelerator="F2")
+        e.add_command(label="Duplicate selected...", command=self.duplicate_selected,
+                      accelerator="Ctrl+D")
+        e.add_command(label="Delete selected...", command=self.delete_selected,
+                      accelerator="Del")
+        e.add_separator()
+        e.add_command(label="Undo last change", command=self.undo, accelerator="Ctrl+Z")
+        e.add_command(label="Open change log", command=self.open_log)
+        m.add_cascade(label="Edit", menu=e)
+        self.edit_menu = e
+
         v = tk.Menu(m, tearoff=False)
         v.add_command(label="Expand all adapters", command=lambda: self._expand(True))
         v.add_command(label="Collapse all adapters", command=lambda: self._expand(False))
+        v.add_separator()
+        v.add_command(label="Show / hide details panel", command=self.toggle_details)
         m.add_cascade(label="View", menu=v)
         self.config(menu=m)
+
         self.bind("<Control-o>", lambda e: self.choose_db())
         self.bind("<Control-e>", lambda e: self.export_csv())
+        self.bind("<Control-f>", lambda e: (self.quick_entry.focus_set(),
+                                            self.quick_entry.select_range(0, "end")))
         self.bind("<F5>", lambda e: self.reload())
+        self.bind("<Control-n>", lambda e: self.new_record())
+        self.bind("<Control-z>", lambda e: self._shortcut(self.undo, e))
+        self.bind("<Control-d>", lambda e: self.duplicate_selected())
+
+    def _shortcut(self, func, event):
+        # Leave Ctrl+Z inside text boxes alone.
+        if isinstance(event.widget, (tk.Entry, ttk.Entry, tk.Text)):
+            return
+        func()
 
     def _build_ui(self):
-        top = ttk.Frame(self, padding=(8, 8, 8, 2))
-        top.pack(fill="x")
-        self.table_label = ttk.Label(top, text="Table:")
-        self.table_label.pack(side="left")
+        # Header bar
+        header = ttk.Frame(self, style="Header.TFrame", padding=(18, 12, 18, 12))
+        header.pack(fill="x")
+        ttk.Label(header, text=APP_TITLE, style="HeaderTitle.TLabel").pack(side="left")
+        self.db_label = ttk.Label(header, text="No database open", style="HeaderSub.TLabel")
+        self.db_label.pack(side="left", padx=(14, 0), pady=(5, 0))
+        self.edit_btn = ttk.Button(header, text="\u270e  Enable editing",
+                                   style="Header.TButton", command=self.toggle_edit)
+        self.edit_btn.pack(side="right")
+        Tooltip(self.edit_btn, "Turn on to add, change or delete connector rows. "
+                               "Every change is logged and can be undone (Ctrl+Z).")
+
+        # Edit-mode banner (hidden until editing is on)
+        self.banner = ttk.Frame(self, style="Banner.TFrame", padding=(18, 6))
+        self.banner_label = ttk.Label(self.banner, style="Banner.TLabel", text="")
+        self.banner_label.pack(side="left")
+        self.undo_link = link(self.banner, "Undo last change", self.undo, color=C["edit"],
+                              bg=C["edit_light"], font=self.f_bold)
+        self.undo_link.pack(side="right")
+
+        # Search bar
+        bar = ttk.Frame(self, padding=(18, 14, 18, 6))
+        bar.pack(fill="x")
+        self.bar = bar
+        self.table_label = ttk.Label(bar, text="Table")
         self.table_var = tk.StringVar()
-        self.table_cb = ttk.Combobox(top, textvariable=self.table_var, state="readonly",
-                                     width=28)
-        self.table_cb.pack(side="left", padx=(4, 16))
+        self.table_cb = ttk.Combobox(bar, textvariable=self.table_var, state="readonly",
+                                     width=24)
         self.table_cb.bind("<<ComboboxSelected>>", lambda e: self.load_table())
 
-        self.quick_label = ttk.Label(top, text="Part number / keywords:")
-        self.quick_label.pack(side="left")
+        self.search_box = ttk.Frame(bar)
+        self.search_box.pack(side="left", fill="x", expand=True)
         self.quick_var = tk.StringVar()
-        self.quick_entry = ttk.Entry(top, textvariable=self.quick_var, width=34,
-                                     font=("Segoe UI", 11))
-        self.quick_entry.pack(side="left", padx=4)
+        self.quick_entry = ttk.Entry(self.search_box, textvariable=self.quick_var,
+                                     font=self.f_search, style="Search.TEntry")
+        self.quick_entry.pack(side="left", fill="x", expand=True)
+        self.quick_ph = Placeholder(self.quick_entry, self.quick_var,
+                                    "Search adapters, part numbers, descriptions...  "
+                                    "(* = wildcard)")
+        self.quick_ph.label.configure(font=self.f_search)
         self.quick_entry.bind("<KeyRelease>", self._quick_typed)
         self.quick_entry.bind("<Return>", lambda e: self.run_search())
-        ttk.Label(top, text="in").pack(side="left", padx=(4, 4))
+        self.quick_entry.bind("<Escape>", lambda e: (self.quick_var.set(""), self.run_search()))
+        ttk.Label(bar, text="in", style="Muted.TLabel").pack(side="left", padx=(10, 6))
         self.in_var = tk.StringVar(value="All columns")
-        self.in_cb = ttk.Combobox(top, textvariable=self.in_var, state="readonly", width=20)
+        self.in_cb = ttk.Combobox(bar, textvariable=self.in_var, state="readonly", width=20)
         self.in_cb.pack(side="left")
         self.in_cb.bind("<<ComboboxSelected>>", lambda e: self.run_search())
-        ttk.Button(top, text="Search", command=self.run_search).pack(side="left", padx=(10, 4))
-        ttk.Button(top, text="Clear all", command=self.clear_all).pack(side="left")
-        ttk.Button(top, text="Export CSV", command=self.export_csv).pack(side="right")
+        ttk.Button(bar, text="Clear all", command=self.clear_all).pack(side="left",
+                                                                         padx=(10, 0))
 
-        opts = ttk.Frame(self, padding=(8, 0, 8, 2))
+        opts = ttk.Frame(self, padding=(18, 0, 18, 4))
         opts.pack(fill="x")
         self.group_var = tk.BooleanVar(value=self.settings.get("group", True))
-        self.group_chk = ttk.Checkbutton(
-            opts, text="Group by adapter (show every connector on each matching adapter)",
-            variable=self.group_var, command=self._options_changed)
+        self.group_chk = ttk.Checkbutton(opts, text="Group by adapter",
+                                         variable=self.group_var,
+                                         command=self._options_changed)
         self.group_chk.pack(side="left")
+        Tooltip(self.group_chk, "Show every connector on each matching adapter. "
+                                "The connectors that matched are highlighted.")
         self.scrap_var = tk.BooleanVar(value=self.settings.get("hide_scrapped", True))
         self.scrap_chk = ttk.Checkbutton(opts, text="Hide scrapped", variable=self.scrap_var,
                                          command=self._options_changed)
-        self.scrap_chk.pack(side="left", padx=(16, 0))
+        self.scrap_chk.pack(side="left", padx=(18, 0))
+        # Active-filter chips
+        self.chips = ttk.Frame(opts)
+        self.chips.pack(side="left", fill="x", expand=True, padx=(22, 0))
 
-        pane = ttk.PanedWindow(self, orient="horizontal")
-        pane.pack(fill="both", expand=True, padx=8, pady=4)
+        # Main area: filters | results | details
+        self.pane = ttk.PanedWindow(self, orient="horizontal")
+        self.pane.pack(fill="both", expand=True, padx=18, pady=(6, 10))
+        self._build_filter_panel()
+        self._build_results()
+        self._build_details()
 
-        left = ttk.LabelFrame(pane, text="Filters", padding=4)
-        self.filter_scroll = ScrollFrame(left)
-        self.filter_scroll.pack(fill="both", expand=True)
-        self.filter_scroll.inner.columnconfigure(1, weight=1)
-        pane.add(left, weight=0)
-
-        right = ttk.Frame(pane)
-        self.tree = ttk.Treeview(right, show="headings", selectmode="extended")
-        vsb = ttk.Scrollbar(right, orient="vertical", command=self.tree.yview)
-        hsb = ttk.Scrollbar(right, orient="horizontal", command=self.tree.xview)
-        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        vsb.grid(row=0, column=1, sticky="ns")
-        hsb.grid(row=1, column=0, sticky="ew")
-        right.rowconfigure(0, weight=1)
-        right.columnconfigure(0, weight=1)
-        from tkinter import font as tkfont
-        bold = tkfont.nametofont("TkDefaultFont").copy()
-        bold.configure(weight="bold")
-        self._bold = bold
-        self.tree.tag_configure("odd", background="#f3f6fa")
-        self.tree.tag_configure("group", background="#dfe8f5", font=bold)
-        self.tree.tag_configure("match", font=bold, background="#fff4cc")
-        self.tree.tag_configure("other", foreground="#555555")
-        self.tree.bind("<Double-1>", self.show_details)
-        self.tree.bind("<Return>", self.show_details)
-        self.tree.bind("<Control-c>", lambda e: self.copy_rows())
-        self.tree.bind("<Button-3>", self._context_menu)
-        pane.add(right, weight=1)
-
+        # Status bar
         self.status_var = tk.StringVar(value="No database open.")
-        ttk.Label(self, textvariable=self.status_var, relief="sunken", anchor="w",
-                  padding=(6, 2)).pack(fill="x", side="bottom")
+        ttk.Label(self, textvariable=self.status_var, style="Status.TLabel",
+                  anchor="w").pack(fill="x", side="bottom")
 
         self.menu = tk.Menu(self, tearoff=False)
-        self.menu.add_command(label="Show details", command=self.show_details)
+        self.menu.add_command(label="Open details window", command=self.show_details)
         self.menu.add_command(label="Copy row(s)", command=self.copy_rows)
         self.menu.add_command(label="Copy adapter number(s)",
                               command=lambda: self.copy_column(self.group_col, unique=True))
         self.menu.add_command(label="Copy connector P/N(s)",
                               command=lambda: self.copy_column(self._part_col()))
+        self.menu.add_separator()
+        self.menu.add_command(label="Edit...", command=self.edit_selected)
+        self.menu.add_command(label="Duplicate...", command=self.duplicate_selected)
+        self.menu.add_command(label="Add connector to this adapter...",
+                              command=self.add_to_adapter)
+        self.menu.add_command(label="Delete...", command=self.delete_selected)
+        self._set_edit_ui()
+
+    def _build_filter_panel(self):
+        left = ttk.Frame(self.pane, style="Card.TFrame", width=280)
+        head = ttk.Frame(left, style="Card.TFrame", padding=(12, 10, 12, 8))
+        head.pack(fill="x")
+        ttk.Label(head, text="Filters", style="Section.TLabel").pack(side="left")
+        link(head, "Reset all", self.clear_all).pack(side="right")
+        ttk.Separator(left).pack(fill="x")
+        self.filter_scroll = ScrollFrame(left)
+        self.filter_scroll.pack(fill="both", expand=True, pady=(8, 0))
+        self.pane.add(left, weight=0)
+
+    def _build_results(self):
+        card = ttk.Frame(self.pane, style="Card.TFrame")
+        top = ttk.Frame(card, style="Card.TFrame", padding=(14, 8, 10, 8))
+        top.pack(fill="x")
+        self.count_label = ttk.Label(top, text="", style="Count.TLabel")
+        self.count_label.pack(side="left")
+        self.sub_count = ttk.Label(top, text="", style="CardMuted.TLabel")
+        self.sub_count.pack(side="left", padx=(10, 0), pady=(2, 0))
+        ttk.Button(top, text="Export CSV", command=self.export_csv).pack(side="right")
+        self.expand_btns = ttk.Frame(top, style="Card.TFrame")
+        link(self.expand_btns, "Expand all", lambda: self._expand(True)).pack(side="left")
+        ttk.Label(self.expand_btns, text=" \u00b7 ", style="CardMuted.TLabel").pack(side="left")
+        link(self.expand_btns, "Collapse all", lambda: self._expand(False)).pack(side="left")
+
+        # Edit toolbar (shown in edit mode)
+        self.edit_bar = ttk.Frame(top, style="Card.TFrame")
+        self.b_new = ttk.Button(self.edit_bar, text="+  New connector",
+                                style="Accent.TButton", command=self.new_record)
+        self.b_new.pack(side="left")
+        self.b_edit = ttk.Button(self.edit_bar, text="Edit", command=self.edit_selected)
+        self.b_edit.pack(side="left", padx=(6, 0))
+        self.b_dup = ttk.Button(self.edit_bar, text="Duplicate",
+                                command=self.duplicate_selected)
+        self.b_dup.pack(side="left", padx=(6, 0))
+        self.b_del = ttk.Button(self.edit_bar, text="Delete", style="Danger.TButton",
+                                command=self.delete_selected)
+        self.b_del.pack(side="left", padx=(6, 0))
+        Tooltip(self.b_new, "Add a connector row (Ctrl+N). If a connector or adapter is "
+                            "selected, the adapter number is filled in for you.")
+        Tooltip(self.b_dup, "Copy the selected connector into a new row you can change "
+                            "(Ctrl+D).")
+        ttk.Separator(card).pack(fill="x")
+
+        body = ttk.Frame(card, style="Card.TFrame")
+        body.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(body, show="headings", selectmode="extended")
+        vsb = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview)
+        hsb = ttk.Scrollbar(body, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=1)
+        self.tree.tag_configure("odd", background=C["alt"])
+        self.tree.tag_configure("group", background=C["group"], font=self._bold)
+        self.tree.tag_configure("match", font=self._bold, background=C["match"])
+        self.tree.tag_configure("other", foreground=C["muted"])
+        self.tree.bind("<Double-1>", self._double_click)
+        self.tree.bind("<Return>", self._double_click)
+        self.tree.bind("<F2>", lambda e: self.edit_selected())
+        self.tree.bind("<Delete>", lambda e: self.delete_selected())
+        self.tree.bind("<Control-c>", lambda e: self.copy_rows())
+        self.tree.bind("<Button-3>", self._context_menu)
+        self.tree.bind("<<TreeviewSelect>>", lambda e: self._update_details())
+
+        self.empty = ttk.Frame(body, style="Card.TFrame")
+        ttk.Label(self.empty, text="No matches", style="Section.TLabel").pack()
+        ttk.Label(self.empty, text="Try a shorter search, or remove a filter.",
+                  style="CardMuted.TLabel").pack(pady=(4, 10))
+        ttk.Button(self.empty, text="Clear all filters", command=self.clear_all).pack()
+        self.pane.add(card, weight=1)
+
+    def _build_details(self):
+        card = ttk.Frame(self.pane, style="Card.TFrame", width=330)
+        self.details_card = card
+        head = ttk.Frame(card, style="Card.TFrame", padding=(14, 10, 14, 6))
+        head.pack(fill="x")
+        ttk.Label(head, text="DETAILS", style="FieldLabel.TLabel").pack(anchor="w")
+        self.d_title = ttk.Label(head, text="Nothing selected", style="DetailTitle.TLabel",
+                                 wraplength=300)
+        self.d_title.pack(anchor="w", pady=(2, 0))
+        self.d_sub = ttk.Label(head, text="Click a row to see all of its fields.",
+                               style="CardMuted.TLabel", wraplength=300, justify="left")
+        self.d_sub.pack(anchor="w")
+
+        btns = ttk.Frame(card, style="Card.TFrame", padding=(14, 4, 14, 8))
+        btns.pack(fill="x")
+        self.d_copy = ttk.Button(btns, text="Copy", command=self.copy_rows)
+        self.d_copy.pack(side="left")
+        self.d_window = ttk.Button(btns, text="Open window", command=self.show_details)
+        self.d_window.pack(side="left", padx=(6, 0))
+        self.d_edit_btns = ttk.Frame(card, style="Card.TFrame", padding=(14, 0, 14, 8))
+        self.d_edit = ttk.Button(self.d_edit_btns, text="Edit", style="Accent.TButton",
+                                 command=self.edit_selected)
+        self.d_edit.pack(side="left")
+        self.d_add = ttk.Button(self.d_edit_btns, text="+ Add connector to adapter",
+                                command=self.add_to_adapter)
+        self.d_add.pack(side="left", padx=(6, 0))
+        ttk.Separator(card).pack(fill="x", side="top")
+
+        body = ttk.Frame(card, style="Card.TFrame")
+        body.pack(fill="both", expand=True)
+        self.dtree = ttk.Treeview(body, columns=("field", "value"), show="headings",
+                                  style="Details.Treeview", selectmode="browse")
+        self.dtree.heading("field", text="Field", anchor="w")
+        self.dtree.heading("value", text="Value", anchor="w")
+        self.dtree.column("field", width=120, stretch=False)
+        self.dtree.column("value", width=200, stretch=True)
+        self.dtree.tag_configure("odd", background=C["alt"])
+        self.dtree.tag_configure("key", font=self._bold)
+        dsb = ttk.Scrollbar(body, orient="vertical", command=self.dtree.yview)
+        self.dtree.configure(yscrollcommand=dsb.set)
+        self.dtree.pack(side="left", fill="both", expand=True)
+        dsb.pack(side="right", fill="y")
+        self.dtree.bind("<Control-c>", self._copy_detail_value)
+        self.dtree.bind("<Double-1>", self._copy_detail_value)
+        self.details_shown = self.settings.get("details", True)
+        if self.details_shown:
+            self.pane.add(card, weight=0)
+
+    def toggle_details(self):
+        if self.details_shown:
+            self.pane.forget(self.details_card)
+        else:
+            self.pane.add(self.details_card, weight=0)
+        self.details_shown = not self.details_shown
+        self.settings["details"] = self.details_shown
+        save_settings(self.settings)
 
     def _options_changed(self):
         self.settings["group"] = self.group_var.get()
@@ -688,6 +1572,8 @@ class App(tk.Tk):
             self.choose_db()
 
     def choose_db(self):
+        if self.editing and not self._stop_editing():
+            return
         path = filedialog.askopenfilename(
             title="Choose the adapter Access database",
             initialdir=APP_DIR,
@@ -697,7 +1583,7 @@ class App(tk.Tk):
 
     def open_db(self, path, sqlite=False):
         try:
-            backend = SqliteBackend(path) if sqlite else AccessBackend(path)
+            backend = open_backend(path, sqlite, writable=self.editing)
             # Go straight to the connectors table; only list the tables (a driver
             # catalog call that can fail to decode) when it isn't there.
             tables = ([(DEFAULT_TABLE, False)] if backend.has_table(DEFAULT_TABLE)
@@ -707,7 +1593,13 @@ class App(tk.Tk):
             return
         if self.backend:
             self.backend.close()
+        if path != self.db_path:
+            self.undo_stack = []
+            self.backed_up = False
         self.backend = backend
+        self.db_path = path
+        self.is_sqlite = sqlite
+        self.log = ChangeLog(path)
         self.full_cache = {}
         self.table_map = {}
         fixed = next((n for n, _ in tables if n.lower() == DEFAULT_TABLE.lower()), None)
@@ -720,14 +1612,15 @@ class App(tk.Tk):
             for name, is_view in tables:
                 self.table_map[f"{name}  (query)" if is_view else name] = name
             if not self.table_cb.winfo_ismapped():
-                self.table_label.pack(side="left", before=self.quick_label)
-                self.table_cb.pack(side="left", padx=(4, 16), before=self.quick_label)
+                self.table_label.pack(side="left", before=self.search_box, padx=(0, 6))
+                self.table_cb.pack(side="left", padx=(0, 14), before=self.search_box)
         labels = list(self.table_map)
         self.table_cb["values"] = labels
         if not sqlite:
             self.settings["last_db"] = path
             save_settings(self.settings)
         self.title(f"{APP_TITLE} - {os.path.basename(path)}")
+        self.db_label.configure(text=path)
         if not labels:
             messagebox.showwarning(APP_TITLE, "No tables were found in that database.")
             return
@@ -739,14 +1632,16 @@ class App(tk.Tk):
 
     def reload(self):
         if self.backend:
-            self.open_db(self.backend.path, sqlite=isinstance(self.backend, SqliteBackend))
+            self.open_db(self.db_path, sqlite=self.is_sqlite)
+
+    def _table(self):
+        return self.table_map.get(self.table_var.get())
 
     def load_table(self):
-        label = self.table_var.get()
-        table = self.table_map.get(label)
+        table = self._table()
         if not table:
             return
-        self.settings.setdefault("tables", {})[self.backend.path] = label
+        self.settings.setdefault("tables", {})[self.db_path] = self.table_var.get()
         save_settings(self.settings)
         self.full_cache = {}
         self.config(cursor="watch")
@@ -757,6 +1652,7 @@ class App(tk.Tk):
             self.group_col = next((c.name for c in self.columns
                                    if c.name.lower() == GROUP_COLUMN.lower()), None)
             self._build_filters(table)
+            self.store = RecordStore(self.backend, table, self.columns)
         except Exception as e:
             messagebox.showerror(APP_TITLE, f"Couldn't read table '{table}':\n\n{e}")
             return
@@ -770,9 +1666,6 @@ class App(tk.Tk):
         ordered = sorted(searchable, key=lambda c: priority(c.name))
         self.in_cb["values"] = ["All columns"] + [c.name for c in ordered]
         self.in_var.set("All columns")
-        self.quick_label.configure(
-            text="Adapter / part number / keywords:" if self.group_col
-            else "Part number / keywords:")
         self.run_search()
 
     def _distinct_values(self, table, col):
@@ -802,24 +1695,66 @@ class App(tk.Tk):
         for w in inner.winfo_children():
             w.destroy()
         self.filter_rows = []
+        self.pick_lists = {}
         cols = [c for c in self.columns if c.kind != "binary"]
         cols = sorted(cols, key=lambda c: priority(c.name))  # stable: keeps db order otherwise
-        ttk.Label(inner, text="Pick from a list, or type and press Enter.\n"
-                              "Typing matches anywhere in the value. * = wildcard.",
-                  foreground="gray").grid(row=0, column=0, columnspan=2, sticky="w",
-                                          padx=4, pady=(0, 6))
-        for i, c in enumerate(cols, start=1):
-            self.filter_rows.append(
-                FilterRow(self, inner, c, self._distinct_values(table, c), i))
+        common = ttk.Frame(inner, style="Card.TFrame")
+        common.pack(fill="x")
+        toggle_row = ttk.Frame(inner, style="Card.TFrame", padding=(12, 2, 12, 10))
+        more = ttk.Frame(inner, style="Card.TFrame")
+        self.more_frame = more
+        self.more_link = link(toggle_row, "", self._toggle_more, font=self.f_bold)
+        self.more_link.pack(side="left")
+        for i, c in enumerate(cols):
+            distinct = self._distinct_values(table, c)
+            if distinct is not None:
+                self.pick_lists[c.name] = distinct
+            parent = common if i < COMMON_FILTERS else more
+            self.filter_rows.append(FilterRow(self, parent, c, distinct))
+        self.n_more = max(0, len(cols) - COMMON_FILTERS)
+        if self.n_more:
+            toggle_row.pack(fill="x")
+            if self.settings.get("more_filters", False):
+                more.pack(fill="x")
+        self._update_more_link()
         self.filter_scroll.canvas.yview_moveto(0)
+
+    def _toggle_more(self):
+        shown = bool(self.more_frame.winfo_ismapped())
+        if shown:
+            self.more_frame.pack_forget()
+        else:
+            self.more_frame.pack(fill="x")
+        self.settings["more_filters"] = not shown
+        save_settings(self.settings)
+        self.after(10, self._update_more_link)
+
+    def _update_more_link(self):
+        if not self.n_more:
+            return
+        shown = bool(self.settings.get("more_filters", False))
+        hidden_active = sum(fr.is_active() for fr in self.filter_rows[COMMON_FILTERS:])
+        text = ("\u25be  Fewer filters" if shown else
+                f"\u25b8  More filters ({self.n_more})")
+        if hidden_active and not shown:
+            text += f"  \u2022 {hidden_active} active"
+        self.more_link.configure(text=text)
 
     # ---------- searching ----------
     def _quick_typed(self, event):
-        if event.keysym in ("Return", "Tab", "Shift_L", "Shift_R", "Control_L", "Control_R"):
+        if event.keysym in ("Return", "Escape", "Tab", "Shift_L", "Shift_R", "Control_L",
+                            "Control_R", "Up", "Down", "Left", "Right"):
+            return
+        self.schedule_search()
+
+    def schedule_search(self, event=None):
+        if event is not None and getattr(event, "keysym", "") in (
+                "Return", "Tab", "Shift_L", "Shift_R", "Control_L", "Control_R", "Up",
+                "Down", "Left", "Right", "Escape"):
             return
         if self._after_id:
             self.after_cancel(self._after_id)
-        self._after_id = self.after(350, self.run_search)
+        self._after_id = self.after(400, self.run_search)
 
     def _exclude(self):
         return SCRAP_RULES if self.scrap_var.get() else []
@@ -836,7 +1771,7 @@ class App(tk.Tk):
         return order + ([part] if part else [])
 
     def _full_rows_by_group(self, table):
-        """All (non-scrapped) rows, grouped by adapter. Cached per table load."""
+        """All (non-scrapped) rows, grouped by adapter. Cached until data changes."""
         key = bool(self.scrap_var.get())
         if key not in self.full_cache:
             sql, params = build_query(table, self.columns, concat=self.backend.concat,
@@ -851,18 +1786,25 @@ class App(tk.Tk):
         return self.full_cache[key]
 
     def run_search(self):
+        if self._after_id:
+            try:
+                self.after_cancel(self._after_id)
+            except Exception:
+                pass
         self._after_id = None
         if not self.backend or not self.columns:
             return
-        table = self.table_map.get(self.table_var.get())
+        table = self._table()
         filters = []
         try:
             for fr in self.filter_rows:
                 filters.extend(fr.conditions())
         except ValueError as e:
-            self.status_var.set(f"Check filter - {e}")
+            self.status_var.set(f"Check the filter - {e}")
             self.bell()
             return
+        self._update_chips()
+        self._update_more_link()
         in_name = self.in_var.get()
         quick_col = next((c for c in self.columns if c.name == in_name), None)
         sql, params = build_query(table, self.columns, self.quick_var.get(), quick_col,
@@ -880,6 +1822,8 @@ class App(tk.Tk):
             return
         finally:
             self.config(cursor="")
+        keep = self._selected_connector()
+        keep = self._as_dict(keep) if keep is not None else None
         truncated = len(rows) > MAX_ROWS
         rows = rows[:MAX_ROWS]
         self.result_cols = names
@@ -895,28 +1839,63 @@ class App(tk.Tk):
                 self.groups.append((adapter, [(r, r in hits) for r in members]))
         self.sort_state = (None, False)
         self._fill_tree()
+        if keep:
+            self._select_values(keep)
 
-        active = len(filters) + (1 if self.quick_var.get().strip() else 0)
         if full is not None:
-            msg = (f"{len(self.groups)} adapter{'s' if len(self.groups) != 1 else ''} "
-                   f"({len(rows)} matching connector{'s' if len(rows) != 1 else ''} "
-                   f"in bold)")
+            self.count_label.configure(text=plural(len(self.groups), "adapter"))
+            self.sub_count.configure(text=f"{plural(len(rows), 'matching connector')} "
+                                          f"highlighted")
+            self.expand_btns.pack(side="right", padx=(0, 14))
         else:
-            msg = f"{len(rows)}{'+' if truncated else ''} matching row{'s' if len(rows) != 1 else ''}"
+            self.count_label.configure(text=plural(len(rows), "connector") +
+                                       ("+" if truncated else ""))
+            self.sub_count.configure(text="")
+            self.expand_btns.pack_forget()
         if truncated:
-            msg += f" - only the first {MAX_ROWS} shown"
-        if active:
-            msg += f"   |   {active} filter{'s' if active != 1 else ''} active"
-        if self._exclude():
-            msg += "   |   scrapped hidden"
-        msg += "   |   Double-click for details, right-click to copy"
-        self.status_var.set(msg)
+            self.sub_count.configure(text=f"only the first {MAX_ROWS:,} are shown")
+        if rows:
+            self.empty.place_forget()
+        else:
+            self.empty.place(relx=0.5, rely=0.4, anchor="center")
+        tips = "Double-click a row to open it" if not self.editing else \
+            "Double-click a row to edit it"
+        self.status_var.set(f"{tips}  \u00b7  right-click to copy  \u00b7  "
+                            "Ctrl+F to search  \u00b7  F5 to reload")
+        self._update_details()
 
     def _normalize(self, names, rows):
         bools = {i for i, n in enumerate(names)
                  if any(c.name == n and c.kind == "bool" for c in self.columns)}
         return [tuple(bool(v) if i in bools and v is not None else v
                       for i, v in enumerate(r)) for r in rows]
+
+    def _update_chips(self):
+        for w in self.chips.winfo_children():
+            w.destroy()
+        items = []
+        q = self.quick_var.get().strip()
+        if q:
+            where = "" if self.in_var.get() == "All columns" else f" in {self.in_var.get()}"
+            items.append((f"\u201c{q}\u201d{where}",
+                          lambda: (self.quick_var.set(""), self.run_search())))
+        for fr in self.filter_rows:
+            if fr.is_active():
+                items.append((fr.chip_text(),
+                              lambda fr=fr: (fr.clear(), self.run_search())))
+        for text, remove in items:
+            chip = tk.Frame(self.chips, background=C["chip"])
+            chip.pack(side="left", padx=(0, 6))
+            tk.Label(chip, text=text, background=C["chip"], foreground=C["chip_text"],
+                     font=self.f_small, padx=8, pady=3).pack(side="left")
+            x = tk.Label(chip, text="\u2715", background=C["chip"],
+                         foreground=C["chip_text"], font=self.f_small, padx=6,
+                         cursor="hand2")
+            x.pack(side="left")
+            x.bind("<Button-1>", lambda e, r=remove: r())
+        if len(items) > 1:
+            link(self.chips, "Clear all", self.clear_all, bg=C["bg"],
+                 font=self.f_small).pack(side="left", padx=(4, 0))
 
     def _expand(self, open_):
         for iid in self.tree.get_children():
@@ -934,23 +1913,25 @@ class App(tk.Tk):
             for name in display:
                 i = self.result_cols.index(name)
                 longest = max([len(name)] + [len(fmt_value(r[i])) for r in sample])
-                width = max(50, min(300, longest * 7 + 18))
-                tree.heading(name, text=name, command=lambda n=name: self.sort_by(n))
-                tree.column(name, width=width, minwidth=40, stretch=False)
+                width = max(60, min(320, longest * 7 + 24))
+                tree.heading(name, text=name, anchor="w",
+                             command=lambda n=name: self.sort_by(n))
+                tree.column(name, width=width, minwidth=40, stretch=False, anchor="w")
         idx = [self.result_cols.index(n) for n in display]
         for name in display:
             arrow = ""
             if self.sort_state[0] == name:
-                arrow = " ▼" if self.sort_state[1] else " ▲"
+                arrow = "  \u25bc" if self.sort_state[1] else "  \u25b2"
             tree.heading(name, text=name + arrow)
 
         if grouped:
             tree.configure(show="tree headings")
             head = self.group_col
             if self.sort_state[0] == head:
-                head += " ▼" if self.sort_state[1] else " ▲"
-            tree.heading("#0", text=head, command=lambda: self.sort_by(self.group_col))
-            tree.column("#0", width=170, minwidth=90, stretch=False)
+                head += "  \u25bc" if self.sort_state[1] else "  \u25b2"
+            tree.heading("#0", text=head, anchor="w",
+                         command=lambda: self.sort_by(self.group_col))
+            tree.column("#0", width=200, minwidth=90, stretch=False)
             part = self._part_col()
             pi = self.result_cols.index(part) if part else None
             many = len(self.groups) > 400
@@ -1000,7 +1981,7 @@ class App(tk.Tk):
         self.run_search()
         self.quick_entry.focus_set()
 
-    # ---------- results actions ----------
+    # ---------- selection & details ----------
     def _selected(self):
         out, seen = [], set()
         for iid in self.tree.selection():
@@ -1010,12 +1991,104 @@ class App(tk.Tk):
                     out.append(r)
         return out
 
+    def _selected_connector(self):
+        """The one connector row selected (not an adapter heading), or None."""
+        sel = self.tree.selection()
+        if len(sel) != 1 or sel[0].startswith("g") and "_" not in sel[0]:
+            return None
+        rows = self.iid_rows.get(sel[0], [])
+        return rows[0] if len(rows) == 1 else None
+
+    def _selected_adapter(self):
+        if not self.group_col:
+            return None
+        rows = self._selected()
+        if not rows:
+            return None
+        gi = self.result_cols.index(self.group_col)
+        adapters = {r[gi] for r in rows}
+        return rows[0][gi] if len(adapters) == 1 else None
+
+    def _as_dict(self, row):
+        return dict(zip(self.result_cols, row))
+
+    def _update_details(self):
+        t = self.dtree
+        t.delete(*t.get_children())
+        sel = self.tree.selection()
+        rows = self._selected()
+        part = self._part_col()
+        is_group = len(sel) == 1 and sel[0].startswith("g") and "_" not in sel[0]
+        state = "normal" if rows else "disabled"
+        for b in (self.d_copy, self.d_window):
+            b.configure(state=state)
+        self._set_edit_buttons()
+        if not rows:
+            self.d_title.configure(text="Nothing selected")
+            self.d_sub.configure(text="Click a row to see all of its fields.")
+            return
+        if is_group or len(rows) > 1:
+            adapter = self._selected_adapter()
+            self.d_title.configure(text=fmt_value(adapter) if adapter is not None
+                                   else f"{len(rows)} connectors")
+            self.d_sub.configure(text=plural(len(rows), "connector") +
+                                 ("" if adapter is not None else " on several adapters"))
+            pi = self.result_cols.index(part) if part else 0
+            di = next((i for i, c in enumerate(self.result_cols)
+                       if c.upper() == "DESCRIPTION"), None)
+            for k, r in enumerate(rows):
+                desc = fmt_value(r[di]) if di is not None else ""
+                t.insert("", "end", values=(fmt_value(r[pi]), desc),
+                         tags=("odd",) if k % 2 else ())
+            t.heading("field", text=label_for(part) if part else "Row")
+            t.heading("value", text="Description")
+            return
+        r = rows[0]
+        t.heading("field", text="Field")
+        t.heading("value", text="Value")
+        self.d_title.configure(text=fmt_value(r[self.result_cols.index(part)]) if part
+                               else fmt_value(r[0]))
+        if self.group_col:
+            self.d_sub.configure(text=f"on {fmt_value(r[self.result_cols.index(self.group_col)])}")
+        else:
+            self.d_sub.configure(text="")
+        for k, (name, v) in enumerate(zip(self.result_cols, r)):
+            tags = ["odd"] if k % 2 else []
+            if name in (self.group_col, part):
+                tags.append("key")
+            t.insert("", "end", values=(label_for(name), fmt_value(v)), tags=tags)
+
+    def _copy_detail_value(self, event=None):
+        sel = self.dtree.selection()
+        if sel:
+            value = self.dtree.item(sel[0], "values")[1]
+            self.clipboard_clear()
+            self.clipboard_append(value)
+            self.status_var.set(f"Copied \u201c{value}\u201d")
+        return "break"
+
+    def _double_click(self, event=None):
+        if event is not None and getattr(event, "y", None) is not None and \
+                self.tree.identify_region(event.x, event.y) == "heading":
+            return
+        if self.editing and self._selected_connector() is not None:
+            self.edit_selected()
+        elif self._selected_connector() is not None:
+            self.show_details()
+
     def _context_menu(self, event):
         iid = self.tree.identify_row(event.y)
         if iid:
             if iid not in self.tree.selection():
                 self.tree.selection_set(iid)
             self.menu.entryconfigure(2, state="normal" if self.group_col else "disabled")
+            one = self._selected_connector() is not None
+            ed = self.editing
+            self.menu.entryconfigure(5, state="normal" if ed and one else "disabled")
+            self.menu.entryconfigure(6, state="normal" if ed and one else "disabled")
+            self.menu.entryconfigure(7, state="normal" if ed and self._selected_adapter()
+                                     is not None else "disabled")
+            self.menu.entryconfigure(8, state="normal" if ed else "disabled")
             self.menu.tk_popup(event.x_root, event.y_root)
 
     def copy_rows(self):
@@ -1026,7 +2099,7 @@ class App(tk.Tk):
             "\n".join("\t".join(fmt_value(v) for v in r) for r in rows)
         self.clipboard_clear()
         self.clipboard_append(text)
-        self.status_var.set(f"Copied {len(rows)} row(s) - paste into Excel.")
+        self.status_var.set(f"Copied {plural(len(rows), 'row')} - paste into Excel.")
 
     def copy_column(self, name, unique=False):
         if not name:
@@ -1038,7 +2111,7 @@ class App(tk.Tk):
         if vals:
             self.clipboard_clear()
             self.clipboard_append("\n".join(vals))
-            self.status_var.set(f"Copied {len(vals)} value(s) from {name}.")
+            self.status_var.set(f"Copied {plural(len(vals), 'value')} from {name}.")
 
     def show_details(self, event=None):
         sel = self.tree.selection()
@@ -1050,22 +2123,28 @@ class App(tk.Tk):
         title_col = self.group_col or self._part_col() or self.result_cols[0]
         ti = self.result_cols.index(title_col)
         win = tk.Toplevel(self)
+        win.configure(background=C["bg"])
         win.title(f"Details - {fmt_value(rows[0][ti])}")
-        win.geometry(f"{min(1200, 260 + 230 * len(rows))}x600")
+        win.geometry(f"{min(1200, 260 + 230 * len(rows))}x620")
         win.transient(self)
-        frame = ttk.Frame(win)
-        frame.pack(fill="both", expand=True, padx=8, pady=8)
+        ttk.Label(win, text=fmt_value(rows[0][ti]), style="DialogTitle.TLabel",
+                  padding=(16, 12, 16, 4)).pack(anchor="w")
+        frame = ttk.Frame(win, style="Card.TFrame")
+        frame.pack(fill="both", expand=True, padx=16, pady=(4, 8))
         cols = ["field"] + [f"c{k}" for k in range(len(rows))]
         t = ttk.Treeview(frame, columns=cols, show="headings")
         hsb = ttk.Scrollbar(frame, orient="horizontal", command=t.xview)
         t.configure(xscrollcommand=hsb.set)
-        t.heading("field", text="Field")
+        t.heading("field", text="Field", anchor="w")
         t.column("field", width=150, stretch=False)
         for k in range(len(rows)):
-            t.heading(f"c{k}", text=f"Connector {k + 1}" if len(rows) > 1 else "Value")
+            t.heading(f"c{k}", text=f"Connector {k + 1}" if len(rows) > 1 else "Value",
+                      anchor="w")
             t.column(f"c{k}", width=220, stretch=len(rows) == 1)
+        t.tag_configure("odd", background=C["alt"])
         for i, name in enumerate(self.result_cols):
-            t.insert("", "end", values=[name] + [fmt_value(r[i]) for r in rows])
+            t.insert("", "end", values=[label_for(name)] + [fmt_value(r[i]) for r in rows],
+                     tags=("odd",) if i % 2 else ())
         t.pack(fill="both", expand=True)
         hsb.pack(fill="x")
 
@@ -1074,7 +2153,7 @@ class App(tk.Tk):
             win.clipboard_append("\n".join(
                 "\t".join([name] + [fmt_value(r[i]) for r in rows])
                 for i, name in enumerate(self.result_cols)))
-        b = ttk.Frame(win, padding=(8, 0, 8, 8))
+        b = ttk.Frame(win, padding=(16, 0, 16, 12))
         b.pack(fill="x")
         ttk.Button(b, text="Copy all", command=copy_all).pack(side="left")
         ttk.Button(b, text="Close", command=win.destroy).pack(side="right")
@@ -1083,7 +2162,7 @@ class App(tk.Tk):
     def export_csv(self):
         if not self.result_cols:
             return
-        table = self.table_map.get(self.table_var.get(), "results")
+        table = self._table() or "results"
         path = filedialog.asksaveasfilename(
             title="Export results", defaultextension=".csv",
             initialfile=f"{re.sub(r'[^A-Za-z0-9_-]+', '_', table)}_search.csv",
@@ -1107,7 +2186,363 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror(APP_TITLE, f"Export failed:\n\n{e}")
             return
-        self.status_var.set(f"Exported {n} rows to {path}")
+        self.status_var.set(f"Exported {plural(n, 'row')} to {path}")
+
+    # ---------- editing ----------
+    def _set_edit_ui(self):
+        if self.editing:
+            self.edit_btn.configure(text="\u270e  Editing ON  \u2013  click to stop",
+                                    style="EditOn.TButton")
+            where = self.log.path if self.log else "the change log"
+            self.banner_label.configure(
+                text="Editing is on. Changes are saved straight to the database and "
+                     f"logged to {where}.")
+            self.banner.pack(fill="x", after=self.edit_btn.master)
+            self.edit_bar.pack(side="right", padx=(0, 14))
+            self.d_edit_btns.pack(fill="x", after=self.d_copy.master)
+        else:
+            self.edit_btn.configure(text="\u270e  Enable editing", style="Header.TButton")
+            self.banner.pack_forget()
+            self.edit_bar.pack_forget()
+            self.d_edit_btns.pack_forget()
+        for label in ("New connector...", "Edit selected...", "Duplicate selected...",
+                      "Delete selected...", "Undo last change"):
+            try:
+                self.edit_menu.entryconfigure(label, state="normal" if self.editing
+                                              else "disabled")
+            except tk.TclError:
+                pass
+        self._set_edit_buttons()
+
+    def _set_edit_buttons(self):
+        one = self._selected_connector() is not None
+        any_ = bool(self.tree.selection())
+        adapter = self._selected_adapter() is not None
+        self.b_edit.configure(state="normal" if one else "disabled")
+        self.b_dup.configure(state="normal" if one else "disabled")
+        self.b_del.configure(state="normal" if any_ else "disabled")
+        self.d_edit.configure(state="normal" if one else "disabled")
+        self.d_add.configure(state="normal" if adapter else "disabled")
+        if self.undo_stack:
+            self.undo_link.configure(text=f"Undo last change ({len(self.undo_stack)})",
+                                     cursor="hand2", foreground=C["edit"])
+        else:
+            self.undo_link.configure(text="Nothing to undo", cursor="",
+                                     foreground=C["faint"])
+
+    def toggle_edit(self):
+        if self.editing:
+            self._stop_editing()
+            return
+        if not self.backend or not self.store:
+            messagebox.showinfo(APP_TITLE, "Open a database first.")
+            return
+        if not self.is_sqlite and not self.backed_up:
+            ans = messagebox.askyesnocancel(
+                "Turn on editing",
+                "Changes you make will be saved straight into\n"
+                f"{self.db_path}\n\n"
+                "Every change is written to a change log, and you can undo your "
+                "changes from this session with Ctrl+Z.\n\n"
+                "Make a backup copy of the database first? (Recommended - it can take "
+                "a minute over the network.)",
+                icon="warning", parent=self)
+            if ans is None:
+                return
+            if ans:
+                self.backup_db(then=self._start_editing)
+                return
+        self._start_editing()
+
+    def _start_editing(self):
+        try:
+            backend = open_backend(self.db_path, self.is_sqlite, writable=True)
+        except Exception as e:
+            messagebox.showerror(
+                APP_TITLE, "Couldn't open the database for editing. It may be open "
+                           "in Access in exclusive mode, or you may not have permission "
+                           f"to change the file or its folder.\n\n{e}")
+            return
+        old = self.backend
+        self.backend = backend
+        self.store = RecordStore(backend, self._table(), self.columns)
+        if old:
+            old.close()
+        self.editing = True
+        self._set_edit_ui()
+        self.run_search()
+
+    def _stop_editing(self):
+        try:
+            backend = open_backend(self.db_path, self.is_sqlite, writable=False)
+        except Exception as e:
+            messagebox.showerror(APP_TITLE, f"Couldn't reopen the database:\n\n{e}")
+            return False
+        old = self.backend
+        self.backend = backend
+        self.store = RecordStore(backend, self._table(), self.columns)
+        if old:
+            old.close()
+        self.editing = False
+        self._set_edit_ui()
+        self.run_search()
+        return True
+
+    def _need_edit(self):
+        if self.editing:
+            return True
+        if messagebox.askyesno(APP_TITLE, "Editing is off. Turn it on now?", parent=self):
+            self.toggle_edit()
+        return self.editing
+
+    def _edit_columns(self):
+        return [c for c in self.store.columns if c.name in self.result_cols]
+
+    def _open_form(self, title, values, on_save, intro=""):
+        RecordDialog(self, title, self._edit_columns(), values, self.pick_lists, on_save,
+                     intro)
+
+    def new_record(self, preset=None):
+        if not self._need_edit():
+            return
+        values = dict(preset or {})
+        if not values and self.group_col:
+            adapter = self._selected_adapter()
+            if adapter is not None:
+                values[self.group_col] = adapter
+        intro = "Fields marked * are required. Pick from a list or type a new value."
+        if values.get(self.group_col) is not None:
+            intro = (f"Adding a connector to {fmt_value(values[self.group_col])}. " + intro)
+        self._open_form("New connector", values, self._save_new, intro)
+
+    def add_to_adapter(self):
+        adapter = self._selected_adapter()
+        if adapter is None:
+            return
+        self.new_record({self.group_col: adapter})
+
+    def duplicate_selected(self):
+        row = self._selected_connector()
+        if row is None or not self._need_edit():
+            return
+        self._open_form("Duplicate connector", self._as_dict(row), self._save_new,
+                        "A copy of the selected connector. Change what you need "
+                        "(for example the adapter or the P/N) and click Save.")
+
+    def edit_selected(self):
+        row = self._selected_connector()
+        if row is None:
+            if self.tree.selection():
+                self.status_var.set("Select a single connector row to edit it.")
+            return
+        if not self._need_edit():
+            return
+        before = self._as_dict(row)
+        title = "Edit connector"
+        part = self._part_col()
+        if part:
+            title += f" \u2013 {fmt_value(before.get(part))}"
+        self._open_form(title, before,
+                        lambda values, dlg: self._save_edit(before, values, dlg),
+                        "Changed fields turn orange. Click Save to write them to the database.")
+
+    def _save_new(self, values, dlg):
+        try:
+            saved = self.store.insert(values)
+        except WriteError as e:
+            dlg.show_error(str(e))
+            return False
+        self._record("insert", None, saved)
+        self._after_write(saved, "Added")
+        return True
+
+    def _save_edit(self, before, values, dlg):
+        changes = {k: v for k, v in values.items() if before.get(k) != v}
+        if not changes:
+            return True
+        try:
+            after = self.store.update(before, changes)
+        except WriteError as e:
+            dlg.show_error(str(e))
+            return False
+        self._record("update", before, after)
+        self._after_write(after, f"Saved {plural(len(changes), 'change')} to")
+        return True
+
+    def delete_selected(self):
+        rows = self._selected()
+        if not rows or not self._need_edit():
+            return
+        part = self._part_col()
+        lines = []
+        for r in rows[:12]:
+            d = self._as_dict(r)
+            lines.append(f"  \u2022 {fmt_value(d.get(part)) if part else ''}"
+                         + (f"  on  {fmt_value(d.get(self.group_col))}"
+                            if self.group_col else ""))
+        if len(rows) > 12:
+            lines.append(f"  ... and {len(rows) - 12} more")
+        if not messagebox.askyesno(
+                "Delete connectors" if len(rows) > 1 else "Delete connector",
+                f"Delete {plural(len(rows), 'connector row')} from the database?\n\n"
+                + "\n".join(lines) + "\n\nYou can undo this with Ctrl+Z until you close "
+                "the app.", icon="warning", parent=self):
+            return
+        done, problems = 0, []
+        for r in rows:
+            before = self._as_dict(r)
+            try:
+                self.store.delete(before)
+            except WriteError as e:
+                problems.append(f"{fmt_value(before.get(part))}: {e}")
+                continue
+            self._record("delete", before, None)
+            done += 1
+        self._after_write(None, None)
+        self.status_var.set(f"Deleted {plural(done, 'connector row')}." +
+                            ("  Undo with Ctrl+Z." if done else ""))
+        if problems:
+            messagebox.showwarning(APP_TITLE, "Some rows weren't deleted:\n\n" +
+                                   "\n\n".join(problems[:5]), parent=self)
+
+    def _record(self, action, before, after, undoable=True):
+        if undoable:
+            self.undo_stack.append((action, before, after))
+        row = after or before
+        adapter = fmt_value(row.get(self.group_col)) if self.group_col else ""
+        part = self._part_col()
+        pn = fmt_value(row.get(part)) if part else ""
+        if action == "update":
+            details = describe_changes(before, after)
+        else:
+            details = describe_values(row)
+        if undoable:
+            label = {"insert": "Added", "update": "Changed", "delete": "Deleted"}[action]
+        else:
+            label = {"insert": "Undo (added back)", "update": "Undo (changed back)",
+                     "delete": "Undo (removed again)"}[action]
+        if self.log and not self.log.write(label, adapter, pn, details):
+            self.status_var.set("Saved, but the change log couldn't be written.")
+
+    def _after_write(self, values, verb):
+        """Refresh the results and select the row that was just saved."""
+        self.full_cache = {}
+        for fr in self.filter_rows:
+            if values and fr.col.name in values:
+                fr.add_choice(values[fr.col.name])
+                if fr.choices:
+                    self.pick_lists[fr.col.name] = sorted(fr.choices.values(), key=sort_key)
+        self.run_search()
+        if values:
+            found = self._select_values(values)
+            what = fmt_value(values.get(self._part_col())) if self._part_col() else "row"
+            msg = f"{verb} {what}."
+            if not found:
+                msg += "  (It doesn't match the current search, so it isn't shown.)"
+            self.status_var.set(msg + "  Undo with Ctrl+Z.")
+        self._set_edit_buttons()
+
+    def _select_values(self, values):
+        want = [fmt_value(values.get(c)) for c in self.result_cols]
+        for iid, rows in self.iid_rows.items():
+            if len(rows) == 1 and not (iid.startswith("g") and "_" not in iid):
+                if [fmt_value(v) for v in rows[0]] == want:
+                    parent = self.tree.parent(iid)
+                    if parent:
+                        self.tree.item(parent, open=True)
+                    self.tree.selection_set(iid)
+                    self.tree.focus(iid)
+                    self.tree.see(iid)
+                    return True
+        return False
+
+    def undo(self):
+        if not self.editing or not self.undo_stack:
+            if self.editing:
+                self.status_var.set("Nothing to undo.")
+            return
+        action, before, after = self.undo_stack[-1]
+        try:
+            if action == "insert":
+                self.store.delete(after)
+                self._record("delete", after, None, undoable=False)
+                shown = None
+            elif action == "update":
+                restore = self.store.update(after, {k: before.get(k) for k in after})
+                self._record("update", after, restore, undoable=False)
+                shown = restore
+            else:
+                self.store.insert(before)
+                self._record("insert", None, before, undoable=False)
+                shown = before
+        except WriteError as e:
+            messagebox.showerror(APP_TITLE, f"Couldn't undo the last change:\n\n{e}",
+                                 parent=self)
+            return
+        self.undo_stack.pop()
+        word = {"insert": "adding", "update": "editing", "delete": "deleting"}[action]
+        self._after_write(shown, "Restored")
+        self.status_var.set(f"Undid {word} a connector.  {len(self.undo_stack)} more "
+                            "change(s) can be undone.")
+
+    def open_log(self):
+        if not self.log or not os.path.exists(self.log.path):
+            messagebox.showinfo(APP_TITLE, "No changes have been logged yet.", parent=self)
+            return
+        try:
+            os.startfile(self.log.path)   # Windows: opens in Excel
+        except Exception:
+            messagebox.showinfo(APP_TITLE, f"The change log is at:\n\n{self.log.path}",
+                                parent=self)
+
+    def backup_db(self, then=None):
+        if not self.db_path:
+            return
+        folder = os.path.dirname(os.path.abspath(self.db_path))
+        base, ext = os.path.splitext(os.path.basename(self.db_path))
+        stamp = dt.datetime.now().strftime("%Y-%m-%d_%H%M")
+        path = filedialog.asksaveasfilename(
+            title="Save a backup copy of the database", initialdir=folder,
+            initialfile=f"{base}_backup_{stamp}{ext}", defaultextension=ext,
+            filetypes=[("Access database", f"*{ext}")], parent=self)
+        if not path:
+            return
+        if os.path.abspath(path) == os.path.abspath(self.db_path):
+            messagebox.showerror(APP_TITLE, "Pick a different name for the backup.")
+            return
+        result = {}
+
+        def work():
+            try:
+                shutil.copy2(self.db_path, path)
+            except Exception as e:
+                result["error"] = e
+            result["done"] = True
+
+        threading.Thread(target=work, daemon=True).start()
+        self.config(cursor="watch")
+        self.status_var.set("Backing up the database...")
+
+        def poll():
+            if not result.get("done"):
+                self.after(300, poll)
+                return
+            self.config(cursor="")
+            if "error" in result:
+                messagebox.showerror(APP_TITLE, f"The backup failed:\n\n{result['error']}")
+                return
+            self.backed_up = True
+            self.status_var.set(f"Backup saved to {path}")
+            if then:
+                then()
+        poll()
+
+    def quit_app(self):
+        try:
+            if self.backend:
+                self.backend.close()
+        finally:
+            self.destroy()
 
 
 def main():
