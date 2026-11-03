@@ -38,6 +38,7 @@ else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(APP_DIR, "adapter_lookup_settings.json")
 MAX_ROWS = 20000         # most connector rows shown at once
+ZOOM_DEFAULT, ZOOM_MIN, ZOOM_MAX = 10, 7, 24   # results table font size (points)
 DISTINCT_LIMIT = 250     # columns with this many values or fewer get a pick-list
 COMMON_FILTERS = 8       # this many filters are always shown; the rest sit under "More filters"
 
@@ -1164,6 +1165,15 @@ class App(tk.Tk):
         self.f_section = (fam, 11, "bold")
         self.f_search = (fam, 12)
         self._bold = tkfont.Font(self, family=fam, size=10, weight="bold")
+        # Results table fonts - resized by zooming (Ctrl+plus / Ctrl+minus / Ctrl+wheel).
+        try:
+            zoom = int(self.settings.get("zoom", ZOOM_DEFAULT))
+        except (TypeError, ValueError):
+            zoom = ZOOM_DEFAULT
+        self.zoom = max(ZOOM_MIN, min(ZOOM_MAX, zoom))
+        self.f_table = tkfont.Font(self, family=fam, size=self.zoom)
+        self.f_table_bold = tkfont.Font(self, family=fam, size=self.zoom, weight="bold")
+        self.f_table_head = tkfont.Font(self, family=fam, size=self.zoom - 1, weight="bold")
 
         s = ttk.Style(self)
         s.theme_use("clam")
@@ -1254,6 +1264,8 @@ class App(tk.Tk):
                     font=(self.f_base[0], 9, "bold"), relief="flat", padding=(8, 6),
                     bordercolor=C["border"], lightcolor=C["heading"], darkcolor=C["border"])
         s.map("Treeview.Heading", background=[("active", "#e2e7ee")])
+        s.configure("Results.Treeview", font=self.f_table, rowheight=self._row_height())
+        s.configure("Results.Treeview.Heading", font=self.f_table_head)
         s.configure("Details.Treeview", rowheight=24)
         s.configure("TPanedwindow", background=C["bg"])
         s.configure("Sash", sashthickness=8, gripcount=0, background=C["bg"])
@@ -1298,6 +1310,13 @@ class App(tk.Tk):
         v.add_command(label="Collapse all adapters", command=lambda: self._expand(False))
         v.add_separator()
         v.add_command(label="Show / hide details panel", command=self.toggle_details)
+        v.add_separator()
+        v.add_command(label="Zoom in", command=lambda: self.set_zoom(self.zoom + 1),
+                      accelerator="Ctrl++")
+        v.add_command(label="Zoom out", command=lambda: self.set_zoom(self.zoom - 1),
+                      accelerator="Ctrl+-")
+        v.add_command(label="Reset zoom", command=lambda: self.set_zoom(ZOOM_DEFAULT),
+                      accelerator="Ctrl+0")
         m.add_cascade(label="View", menu=v)
         self.config(menu=m)
 
@@ -1309,6 +1328,11 @@ class App(tk.Tk):
         self.bind("<Control-n>", lambda e: self.new_record())
         self.bind("<Control-z>", lambda e: self._shortcut(self.undo, e))
         self.bind("<Control-d>", lambda e: self.duplicate_selected())
+        for seq in ("<Control-plus>", "<Control-equal>", "<Control-KP_Add>"):
+            self.bind(seq, lambda e: self.set_zoom(self.zoom + 1))
+        for seq in ("<Control-minus>", "<Control-KP_Subtract>"):
+            self.bind(seq, lambda e: self.set_zoom(self.zoom - 1))
+        self.bind("<Control-0>", lambda e: self.set_zoom(ZOOM_DEFAULT))
 
     def _shortcut(self, func, event):
         # Leave Ctrl+Z inside text boxes alone.
@@ -1393,9 +1417,25 @@ class App(tk.Tk):
         self._build_details()
 
         # Status bar
+        status = ttk.Frame(self, style="Card.TFrame")
+        status.pack(fill="x", side="bottom")
+        zoom = ttk.Frame(status, style="Card.TFrame")
+        zoom.pack(side="right", padx=(0, 10))
+        zoom_out = link(zoom, "−", lambda: self.set_zoom(self.zoom - 1), font=self.f_bold)
+        zoom_out.pack(side="left", padx=4)
+        self.zoom_var = tk.StringVar(value=self._zoom_text())
+        zoom_pct = link(zoom, "", lambda: self.set_zoom(ZOOM_DEFAULT), color=C["muted"],
+                        font=self.f_small)
+        zoom_pct.configure(textvariable=self.zoom_var, width=5)
+        zoom_pct.pack(side="left")
+        zoom_in = link(zoom, "+", lambda: self.set_zoom(self.zoom + 1), font=self.f_bold)
+        zoom_in.pack(side="left", padx=4)
+        Tooltip(zoom_out, "Zoom out of the results table (Ctrl+minus)")
+        Tooltip(zoom_pct, "Results table zoom - click to reset to 100% (Ctrl+0)")
+        Tooltip(zoom_in, "Zoom in on the results table (Ctrl+plus, or Ctrl+mouse wheel)")
         self.status_var = tk.StringVar(value="No database open.")
-        ttk.Label(self, textvariable=self.status_var, style="Status.TLabel",
-                  anchor="w").pack(fill="x", side="bottom")
+        ttk.Label(status, textvariable=self.status_var, style="Status.TLabel",
+                  anchor="w").pack(side="left", fill="x", expand=True)
 
         self.menu = tk.Menu(self, tearoff=False)
         self.menu.add_command(label="Open details window", command=self.show_details)
@@ -1458,7 +1498,8 @@ class App(tk.Tk):
 
         body = ttk.Frame(card, style="Card.TFrame")
         body.pack(fill="both", expand=True)
-        self.tree = ttk.Treeview(body, show="headings", selectmode="extended")
+        self.tree = ttk.Treeview(body, show="headings", selectmode="extended",
+                                 style="Results.Treeview")
         vsb = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview)
         hsb = ttk.Scrollbar(body, orient="horizontal", command=self.tree.xview)
         self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
@@ -1468,8 +1509,8 @@ class App(tk.Tk):
         body.rowconfigure(0, weight=1)
         body.columnconfigure(0, weight=1)
         self.tree.tag_configure("odd", background=C["alt"])
-        self.tree.tag_configure("group", background=C["group"], font=self._bold)
-        self.tree.tag_configure("match", font=self._bold, background=C["match"])
+        self.tree.tag_configure("group", background=C["group"], font=self.f_table_bold)
+        self.tree.tag_configure("match", font=self.f_table_bold, background=C["match"])
         self.tree.tag_configure("other", foreground=C["muted"])
         self.tree.bind("<Double-1>", self._double_click)
         self.tree.bind("<Return>", self._double_click)
@@ -1477,6 +1518,7 @@ class App(tk.Tk):
         self.tree.bind("<Delete>", lambda e: self.delete_selected())
         self.tree.bind("<Control-c>", lambda e: self.copy_rows())
         self.tree.bind("<Button-3>", self._context_menu)
+        self.tree.bind("<Control-MouseWheel>", self._zoom_wheel)
         self.tree.bind("<<TreeviewSelect>>", lambda e: self._update_details())
 
         self.empty = ttk.Frame(body, style="Card.TFrame")
@@ -1542,6 +1584,37 @@ class App(tk.Tk):
         self.details_shown = not self.details_shown
         self.settings["details"] = self.details_shown
         save_settings(self.settings)
+
+    # ---------- zoom (results table only) ----------
+    def _zoom_scale(self):
+        return self.zoom / ZOOM_DEFAULT
+
+    def _zoom_text(self):
+        return f"{round(self._zoom_scale() * 100)}%"
+
+    def _row_height(self):
+        return max(self.f_table.metrics("linespace") + 6, round(26 * self._zoom_scale()))
+
+    def set_zoom(self, size):
+        size = max(ZOOM_MIN, min(ZOOM_MAX, size))
+        if size == self.zoom:
+            return
+        ratio = size / self.zoom
+        self.zoom = size
+        self.f_table.configure(size=size)
+        self.f_table_bold.configure(size=size)
+        self.f_table_head.configure(size=size - 1)
+        ttk.Style(self).configure("Results.Treeview", rowheight=self._row_height())
+        for col in ("#0",) + tuple(self.tree["columns"]):
+            width = self.tree.column(col, "width")
+            self.tree.column(col, width=max(40, round(width * ratio)))
+        self.zoom_var.set(self._zoom_text())
+        self.settings["zoom"] = size
+        save_settings(self.settings)
+
+    def _zoom_wheel(self, event):
+        self.set_zoom(self.zoom + (1 if event.delta > 0 else -1))
+        return "break"
 
     def _options_changed(self):
         self.settings["group"] = self.group_var.get()
@@ -1913,7 +1986,7 @@ class App(tk.Tk):
             for name in display:
                 i = self.result_cols.index(name)
                 longest = max([len(name)] + [len(fmt_value(r[i])) for r in sample])
-                width = max(60, min(320, longest * 7 + 24))
+                width = round(max(60, min(320, longest * 7 + 24)) * self._zoom_scale())
                 tree.heading(name, text=name, anchor="w",
                              command=lambda n=name: self.sort_by(n))
                 tree.column(name, width=width, minwidth=40, stretch=False, anchor="w")
@@ -1931,7 +2004,8 @@ class App(tk.Tk):
                 head += "  \u25bc" if self.sort_state[1] else "  \u25b2"
             tree.heading("#0", text=head, anchor="w",
                          command=lambda: self.sort_by(self.group_col))
-            tree.column("#0", width=200, minwidth=90, stretch=False)
+            tree.column("#0", width=round(200 * self._zoom_scale()), minwidth=90,
+                        stretch=False)
             part = self._part_col()
             pi = self.result_cols.index(part) if part else None
             many = len(self.groups) > 400

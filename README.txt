@@ -59,6 +59,9 @@ SEARCHING
  - Details panel (right) shows every field of the selected row. Double-click a
    value there to copy it. View > Show / hide details panel to turn it off.
  - Click a column header to sort. Right-click / Ctrl+C to copy rows or part numbers.
+ - Zoom the results table in or out: Ctrl + mouse wheel over the table,
+   Ctrl+plus / Ctrl+minus, the - 100% + buttons at the bottom right, or the View
+   menu. Ctrl+0 (or clicking the %) resets to 100%. The zoom is remembered.
  - Export CSV saves the current results (opens in Excel).
 
 EDITING (adding, changing and deleting connectors)
